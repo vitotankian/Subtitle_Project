@@ -1,0 +1,5269 @@
+Directory Structure:
+
+└── ./
+    ├── cli
+    │   └── bootstrap.js
+    ├── docs
+    │   ├── api
+    │   │   ├── requests
+    │   │   │   ├── defineCatalogHandler.md
+    │   │   │   ├── defineMetaHandler.md
+    │   │   │   ├── defineResourceHandler.md
+    │   │   │   ├── defineStreamHandler.md
+    │   │   │   └── defineSubtitlesHandler.md
+    │   │   ├── responses
+    │   │   │   ├── addon_catalog.md
+    │   │   │   ├── content.types.md
+    │   │   │   ├── manifest.md
+    │   │   │   ├── meta.links.md
+    │   │   │   ├── meta.md
+    │   │   │   ├── stream.md
+    │   │   │   └── subtitles.md
+    │   │   └── README.md
+    │   ├── deploying
+    │   │   ├── beamup.md
+    │   │   ├── glitch.md
+    │   │   ├── now.md
+    │   │   └── README.md
+    │   ├── advanced.md
+    │   ├── deep-links.md
+    │   ├── examples.md
+    │   ├── protocol.md
+    │   ├── README.md
+    │   └── testing.md
+    ├── examples
+    │   └── from-readme.js
+    ├── src
+    │   ├── builder.js
+    │   ├── getRouter.js
+    │   ├── index.js
+    │   ├── landingTemplate.js
+    │   ├── publishToCentral.js
+    │   └── serveHTTP.js
+    ├── test
+    │   └── basic.js
+    ├── _config.yml
+    ├── .eslintrc.js
+    ├── .travis.yml
+    ├── LICENSE.md
+    ├── package-lock.json
+    ├── package.json
+    └── README.md
+
+
+
+---
+File: /cli/bootstrap.js
+---
+
+#!/usr/bin/env node
+
+const [,, ...args] = process.argv
+const dir = args.find(arg => !arg.startsWith('--'))
+
+const chalk = require('chalk')
+const fs = require('fs')
+const path = require('path')
+const {promisify} = require('util')
+const mkdirp = promisify(require('mkdirp'))
+const inquirer = require('inquirer')
+
+if (typeof(dir) !== 'string') usage()
+if (fs.existsSync(dir)) usage({exists: true})
+
+// @TODO split this and clean it up
+
+createAddon()
+	.then(() => {
+		console.log(chalk.green('BOOTSTRAPPER: addon created!'))
+		console.log('BOOTSTRAPPER: launch your addon by running:\n\n\n')
+		console.log(chalk.blue(`cd ${dir}`))
+		console.log(chalk.blue('npm install'))
+		console.log(chalk.blue('npm start -- --launch'))
+	})
+
+async function createAddon() {
+	await mkdirp(dir)
+	
+	console.log(chalk.green(`BOOTSTRAPPER: directory created: ${dir}`))
+
+	const userInput = await inquirer.prompt([
+		{
+			type: 'input',
+			name: 'name',
+			message: 'What is the addon name?',
+		},
+		{
+			type: 'input',
+			name: 'description',
+			message: 'What is your addon\'s description?',
+		},
+		{
+			type: 'checkbox',
+			message: 'Select the resources that your addon provides',
+			name: 'resources',
+			choices: [
+				{name: 'catalog'},
+				{name: 'stream'},
+				{name: 'meta'},
+				{name: 'subtitles'},
+			]
+		},
+		{
+			type: 'checkbox',
+			message: 'Select the types that your addon provides',
+			name: 'types',
+			choices: [
+				{name: 'movie'},
+				{name: 'series'},
+				{name: 'channel'},
+				{name: 'tv'},
+			],
+		},
+	])
+
+	if (
+		!userInput.resources.includes('meta') && !userInput.resources.includes('subtitles')
+		&& !userInput.types.includes('channel') && !userInput.types.includes('tv')
+	) {
+		const isFromIMDb = await inquirer.prompt([
+			{
+				type: 'confirm',
+				message: `Is your addon going to provide ${userInput.resources.join('/')} for IMDb items only?`,
+				name: 'isIMDb',
+				default: false,
+			}
+		])
+		if (isFromIMDb.isIMDb) userInput.idPrefixes = ['tt']
+	}
+
+	const identifier = userInput.name.split(' ')[0].replace(/\W/g, '')
+	const manifest = {
+		id: 'community.'+identifier,
+		version: '0.0.1',
+		// @TODO idPrefixes
+		catalogs: userInput.resources.includes('catalog') ? [{ type: 'movie', id: 'top' }] : [],
+		resources: [],
+		types: ['movie'],
+		...userInput,
+	}
+
+	const outputIndexJS = genAddonJS(manifest, userInput.resources, userInput.types)
+
+	fs.writeFileSync(path.join(dir, 'addon.js'), outputIndexJS)
+	fs.writeFileSync(path.join(dir, 'server.js'), serverTmpl())
+	fs.chmodSync(path.join(dir, 'server.js'), '755')
+	fs.writeFileSync(path.join(dir, 'package.json'), packageTmpl({
+		version: manifest.version,
+		name: 'stremio-addon-'+identifier,
+		description: userInput.description,
+	}))
+	fs.writeFileSync(path.join(dir, '.gitignore'), gitignoreTmpl())
+}
+
+function usage({exists} = {}) {
+	if (exists) console.log(chalk.red('Output directory already exists!'))
+	else console.log(`Usage: ${process.argv[1]} {OUTPUT DIRECTORY}`)
+	process.exit(1)
+}
+
+const serverTmpl = () => `#!/usr/bin/env node
+
+const { serveHTTP, publishToCentral } = require("stremio-addon-sdk")
+const addonInterface = require("./addon")
+serveHTTP(addonInterface, { port: process.env.PORT || ${Math.floor(Math.random() * 16383) + 49152} })
+
+// when you've deployed your addon, un-comment this line
+// publishToCentral("https://my-addon.awesome/manifest.json")
+// for more information on deploying, see: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/deploying/README.md
+`
+
+const headerTmpl = (manifest) => `const { addonBuilder } = require("stremio-addon-sdk")
+
+// Docs: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/responses/manifest.md
+const manifest = ${JSON.stringify(manifest, null, '\t')}
+const builder = new addonBuilder(manifest)
+`
+
+// @TODO: auto update the stremio-addon-sdk version
+const packageTmpl = ({ name, version, description }) => `{
+	"name": "${name}",
+	"version": "${version}",
+	"description": "${description}",
+	"scripts": {
+		"start": "node server.js"
+	},
+	"dependencies": {
+		"stremio-addon-sdk": "1.1.x"
+	}
+}
+`
+
+const gitignoreTmpl = () => `node_modules
+`
+
+const catalogTmpl = () => `
+builder.defineCatalogHandler(({type, id, extra}) => {
+	console.log("request for catalogs: "+type+" "+id)
+	// Docs: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/requests/defineCatalogHandler.md
+	return Promise.resolve({ metas: [
+		{
+			id: "tt1254207",
+			type: "movie",
+			name: "The Big Buck Bunny",
+			poster: "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Big_buck_bunny_poster_big.jpg/220px-Big_buck_bunny_poster_big.jpg"
+		}
+	] })
+})
+`
+
+const metaTmpl = () => `
+builder.defineMetaHandler(({type, id}) => {
+	console.log("request for meta: "+type+" "+id)
+	// Docs: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/requests/defineMetaHandler.md
+	return Promise.resolve({ meta: null })
+})
+`
+
+const streamsMovieTmpl = () => `
+builder.defineStreamHandler(({type, id}) => {
+	console.log("request for streams: "+type+" "+id)
+	// Docs: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/requests/defineStreamHandler.md
+	if (type === "movie" && id === "tt1254207") {
+		// serve one stream to big buck bunny
+		const stream = { url: "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4" }
+		return Promise.resolve({ streams: [stream] })
+	}
+
+	// otherwise return no streams
+	return Promise.resolve({ streams: [] })
+})
+`
+
+const streamsTmpl = () => `
+builder.defineStreamHandler(({type, id}) => {
+	console.log("request for streams: "+type+" "+id)
+	// Docs: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/requests/defineStreamHandler.md
+	// return no streams
+	return Promise.resolve({ streams: [] })
+})
+`
+
+const subtitlesTmpl = () => `
+builder.defineSubtitlesHandler(({type, id, extra}) => {
+	console.log("request for subtitles: "+type+" "+id)
+	// Docs: https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/requests/defineSubtitlesHandler.md
+	return Promise.resolve({ subtitles: [] })
+})
+`
+
+// @TODO port
+const footerTmpl = () => `
+module.exports = builder.getInterface()`
+
+function genAddonJS(manifest, resources, types) {
+	return [headerTmpl(manifest)]
+		.concat(resources.includes('catalog') ? [catalogTmpl()] : [])
+		.concat(resources.includes('meta') ? [metaTmpl()] : [])
+		.concat(resources.includes('stream') ? [types.includes('movie') ? streamsMovieTmpl() : streamsTmpl()] : [])
+		.concat(resources.includes('subtitles') ? [subtitlesTmpl()] : [])
+		.concat(footerTmpl())
+		.join('')
+}
+
+
+
+---
+File: /docs/api/requests/defineCatalogHandler.md
+---
+
+## defineCatalogHandler
+
+This method handles catalog requests, including search.
+
+
+### Arguments:
+
+`args` - request object; parameters described below
+
+### Returns:
+
+A promise that resolves to an object containing `{ metas: [] }` with an array of [Meta Preview Object](../responses/meta.md#meta-preview-object)
+
+The resolving object can also include the following cache related properties:
+
+- `{ cacheMaxAge: int }` (in seconds) which sets the `Cache-Control` header to `max-age=$cacheMaxAge` and overwrites the global cache time set in `serveHTTP` [options](../../README.md#servehttpaddoninterface-options)
+
+- `{ staleRevalidate: int }` (in seconds) which sets the `Cache-Control` header to `stale-while-revalidate=$staleRevalidate`
+
+- `{ staleError: int }` (in seconds) which sets the `Cache-Control` header to `stale-if-error=$staleError`
+
+
+## Request Parameters
+
+``type`` - type of the catalog's content; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](../responses/content.types.md))
+
+``id`` - string id of the catalog that is requested; these are set in the [Manifest Object](../responses/manifest.md)
+
+``extra`` - object that holds additional properties; defined below
+
+``config`` - object with user settings, see [Manifest - User Data](../responses/manifest.md#user-data)
+
+
+## Extra Parameters
+
+If you wish to use these parameters, you'll need to specify them in `extra` for the catalog in the [addon manifest](../responses/manifest.md#extra-properties)
+
+``search`` - set in the `extra` object; string to search for in the catalog
+
+``genre`` - set in the `extra` object; a string to filter the feed or search results by genres
+
+``skip`` - set in the `extra` object; used for catalog pagination, refers to the number of items skipped from the beginning of the catalog; the standard page size in Stremio is 100, so the `skip` value will be a multiple of 100; if you return less than 100 items, Stremio will consider this to be the end of the catalog
+
+
+## Basic Example
+
+
+```javascript
+builder.defineCatalogHandler(function(args) {
+    if (args.type === 'movie' && args.id === 'top') {
+
+        // we will only respond with Big Buck Bunny
+        // to both feed and search requests
+
+        const meta = {
+            id: 'tt1254207',
+            name: 'Big Buck Bunny',
+            releaseInfo: '2008',
+            poster: 'https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg',
+            posterShape: 'poster',
+            banner: 'https://image.tmdb.org/t/p/original/aHLST0g8sOE1ixCxRDgM35SKwwp.jpg',
+            type: 'movie'
+        }
+
+        if (args.extra && args.extra.search) {
+
+            // catalog search request
+
+            if (args.extra.search == 'big buck bunny') {
+                return Promise.resolve({ metas: [meta] })
+            } else {
+                return Promise.resolve({ metas: [] })
+            }
+
+        } else {
+
+            // catalog feed request
+
+            return Promise.resolve({ metas: [meta] })
+
+        }
+
+    } else {
+        // otherwise return empty catalog
+        return Promise.resolve({ metas: [] })
+    }
+})
+```
+
+[Meta Preview Object Definition](../responses/meta.md#meta-preview-object)
+
+
+
+---
+File: /docs/api/requests/defineMetaHandler.md
+---
+
+## defineMetaHandler
+
+This method handles metadata requests. (title, releaseInfo, poster, background, etc.)
+
+### Arguments:
+
+`args` - request object; parameters described below
+
+### Returns:
+
+A promise resolving to an object containing `{ meta: {} }` with a [Meta Object](../responses/meta.md)
+
+The resolving object can also include the following cache related properties:
+
+- `{ cacheMaxAge: int }` (in seconds) which sets the `Cache-Control` header to `max-age=$cacheMaxAge` and overwrites the global cache time set in `serveHTTP` [options](../../README.md#servehttpaddoninterface-options)
+
+- `{ staleRevalidate: int }` (in seconds) which sets the `Cache-Control` header to `stale-while-revalidate=$staleRevalidate`
+
+- `{ staleError: int }` (in seconds) which sets the `Cache-Control` header to `stale-if-error=$staleError`
+
+
+## Request Parameters
+
+``type`` - type of the item; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](../responses/content.types.md))
+
+``id`` - string id of the meta item that is requested; these are set in the [Meta Preview Object](../responses/meta.md#meta-preview-object)
+
+``config`` - object with user settings, see [Manifest - User Data](../responses/manifest.md#user-data)
+
+
+## Basic Example
+
+```javascript
+builder.defineMetaHandler(function(args) {
+    if (args.type === 'movie' && args.id === 'tt1254207') {
+        // serve metadata for Big Buck Bunny
+        const metaObj = {
+            id: 'tt1254207',
+            name: 'Big Buck Bunny',
+            releaseInfo: '2008',
+            poster: 'https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg',
+            posterShape: 'poster',
+            type: 'movie'
+        }
+        return Promise.resolve({ meta: metaObj })
+    } else {
+        // otherwise return no meta
+        return Promise.resolve({ meta: {} })
+    }
+})
+```
+
+[Meta Object Definition](../responses/meta.md)
+
+
+
+---
+File: /docs/api/requests/defineResourceHandler.md
+---
+
+## defineResourceHandler
+
+This method currently handles addon catalog requests. As opposed to `defineCatalogHandler()` which handles meta catalogs, this method handles catalogs of addon manifests. This means that an addon can be used to just pass a list of other addons that can be installed in Stremio.
+
+
+### Arguments:
+
+`args` - request object; parameters described below
+
+### Returns:
+
+A promise that resolves to an object containing `{ addons: [] }` with an array of [Catalog Addon Object](../responses/addon_catalog.md)
+
+The resolving object can also include the following cache related properties:
+
+- `{ cacheMaxAge: int }` (in seconds) which sets the `Cache-Control` header to `max-age=$cacheMaxAge` and overwrites the global cache time set in `serveHTTP` [options](../../README.md#servehttpaddoninterface-options)
+
+- `{ staleRevalidate: int }` (in seconds) which sets the `Cache-Control` header to `stale-while-revalidate=$staleRevalidate`
+
+- `{ staleError: int }` (in seconds) which sets the `Cache-Control` header to `stale-if-error=$staleError`
+
+
+## Request Parameters
+
+``type`` - type of the catalog's content; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](../responses/content.types.md))
+
+``id`` - string id of the catalog that is requested; these are set in the [Manifest Object](../responses/manifest.md)
+
+``config`` - object with user settings, see [Manifest - User Data](../responses/manifest.md#user-data)
+
+
+## Basic Example
+
+
+```javascript
+builder.defineResourceHandler('addon_catalog', function(args) {
+    return Promise.resolve({
+        addons: [
+            {
+                transportName: 'http',
+                transportUrl: 'https://example.addon.org/manifest.json',
+                manifest: {
+                    id: 'org.myexampleaddon',
+                    version: '1.0.0',
+                    name: 'simple example',
+                    catalogs: [],
+                    resources: ['stream'],
+                    types: ['movie'],
+                    idPrefixes: ['tt']
+                }
+            }
+        ]
+    })
+})
+```
+
+[Catalog Addon Object Definition](../responses/addon_catalog.md)
+
+
+
+---
+File: /docs/api/requests/defineStreamHandler.md
+---
+
+## defineStreamHandler
+
+This method handles stream requests.
+
+### Arguments:
+
+`args` - request object; parameters described below
+
+### Returns:
+
+A promise resolving to an an object containing `{ streams: [] }` with an array of [Stream Objects](../responses/stream.md). The streams should be ordered from highest to lowest quality
+
+The resolving object can also include the following cache related properties:
+
+- `{ cacheMaxAge: int }` (in seconds) which sets the `Cache-Control` header to `max-age=$cacheMaxAge` and overwrites the global cache time set in `serveHTTP` [options](../../README.md#servehttpaddoninterface-options)
+
+- `{ staleRevalidate: int }` (in seconds) which sets the `Cache-Control` header to `stale-while-revalidate=$staleRevalidate`
+
+- `{ staleError: int }` (in seconds) which sets the `Cache-Control` header to `stale-if-error=$staleError`
+
+
+## Request Parameters
+
+``type`` - type of the item that we're requesting streams for; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](../responses/content.types.md))
+
+``id`` - a Video ID as described in the [Video Object](../responses/meta.md#video-object)
+
+**The Video ID is the same as the Meta ID for movies**.
+
+For IMDb series (provided by Cinemeta), the video ID is formed by joining the Meta ID, season and episode with a colon (e.g. `"tt0898266:9:17"`).
+
+``config`` - object with user settings, see [Manifest - User Data](../responses/manifest.md#user-data)
+
+## Basic Example
+
+```javascript
+builder.defineStreamHandler(function(args) {
+    if (args.type === 'movie' && args.id === 'tt1254207') {
+        // serve one stream for big buck bunny
+        const stream = { url: 'http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4' }
+        return Promise.resolve({ streams: [stream] })
+    } else {
+        // otherwise return no streams
+        return Promise.resolve({ streams: [] })
+    }
+})
+```
+
+[Stream Object Definition](../responses/stream.md)
+
+_Note: You may require additional metadata for the requested item (such as name, releaseInfo, etc), if the requested ID is a IMDB ID (Cinemeta, for example, uses only IMDB IDs), then please refer to [Getting Metadata from Cinemeta](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/advanced.md#getting-metadata-from-cinemeta) for this purpose._
+
+
+
+---
+File: /docs/api/requests/defineSubtitlesHandler.md
+---
+
+## defineSubtitlesHandler
+
+This method handles subtitle requests.
+
+### Arguments:
+
+`args` - request object; parameters defined below
+
+### Returns:
+
+A promise resolving to an object containing `{ subtitles: [] }` with an array of [Subtitle Objects](../responses/subtitles.md).
+
+The resolving object can also include the following cache related properties:
+
+- `{ cacheMaxAge: int }` (in seconds) which sets the `Cache-Control` header to `max-age=$cacheMaxAge` and overwrites the global cache time set in `serveHTTP` [options](../../README.md#servehttpaddoninterface-options)
+
+- `{ staleRevalidate: int }` (in seconds) which sets the `Cache-Control` header to `stale-while-revalidate=$staleRevalidate`
+
+- `{ staleError: int }` (in seconds) which sets the `Cache-Control` header to `stale-if-error=$staleError`
+
+
+## Request Parameters
+
+``type`` - type of the item that we're requesting subtitles for; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](../responses/content.types.md))
+
+``id`` -  string id of the video that we're requesting subtitles for (videoId); see [Meta Object](../responses/meta.md)
+
+``extra`` - object that holds additional properties; parameters defined below
+
+``config`` - object with user settings, see [Manifest - User Data](../responses/manifest.md#user-data)
+
+
+## Extra Parameters
+
+``videoHash`` - string [OpenSubtitles file hash](http://trac.opensubtitles.org/projects/opensubtitles/wiki/HashSourceCodes) for the video
+
+``videoSize`` - size of the video file in bytes
+
+``filename`` - filename of the video file
+
+
+## Basic Example
+
+```javascript
+builder.defineSubtitlesHandler(function(args) {
+    if (args.id === 'tt1254207') {
+        // serve one subtitle for big buck bunny
+        const subtitle = {
+            url: 'https://mkvtoolnix.download/samples/vsshort-en.srt',
+            lang: 'eng'
+        }
+        return Promise.resolve({ subtitles: [subtitle] })
+    } else {
+        // otherwise return no subtitles
+        return Promise.resolve({ subtitles: [] })
+    }
+})
+```
+
+[Subtitle Object Definition](../responses/subtitles.md)
+
+
+
+---
+File: /docs/api/responses/addon_catalog.md
+---
+
+## Addon Catalog Object
+
+Used as a response for [`defineResourceHandler`](../requests/defineResourceHandler.md)
+
+### Properties
+
+* ``transportName`` - **required** - string, only `http` is currently officially supported
+* ``transportUrl`` - **required** - string, the URL of the addon's `manifest.json` file
+* ``manifest`` - **required** - object representing the addon's [Manifest Object](./manifest.md)
+
+
+
+---
+File: /docs/api/responses/content.types.md
+---
+
+## Content types
+
+**Stremio supports the following content types as of Apr 2016:**
+
+* ``movie`` - movie type - has metadata like name, genre, description, director, actors, images, etc. 
+* ``series`` - series type - has all the metadata a movie has, plus an array of episodes
+* ``channel`` - channel type - created to cover YouTube channels; has name, description and an array of uploaded videos
+* ``tv`` - tv type - has name, description, genre; streams for ``tv`` should be live (without duration)
+
+**If you think Stremio should add another content type, feel free to open an issue on this repository.**
+
+
+
+---
+File: /docs/api/responses/manifest.md
+---
+
+### Manifest format
+
+The first thing to define for your addon is the manifest, which describes it's name, purpose and some technical details.
+
+Valid properties are:
+
+
+## Basic information
+
+``id`` - **required** - string, identifier, dot-separated, e.g. "com.stremio.filmon"
+
+``name`` - **required** - string, human readable name
+
+``description`` - **required** - string, human readable description
+
+``version`` - **required** - string, [semantic version](https://semver.org/) of the addon
+
+
+## Filtering properties
+
+**NOTE:** In order to understand the next properties better, please check out the [protocol documentation](../../protocol.md) and keep in mind requests to addons are formed in the format of `/{resource}/{type}/{id}`
+
+``resources`` - **required** - array of objects or strings, supported resources - for example ``["catalog", "meta", "stream", "subtitles", "addon_catalog"]``, resources can also be added as objects instead of strings, for additional details on how they should be requested, example: `{ "name": "stream", "types": [ "movie" ], "idPrefixes": [ "tt" ] }` (see the **ADVANCED** note)
+
+``types`` - **required** - array of strings, supported types, from all the [``Content Types``](./content.types.md). If you wish to provide different sets of types for different resources, see the **ADVANCED** note.
+
+``idPrefixes`` - _optional_ - array of strings, use this if you want your addon to be called only for specific content IDs - for example, if you set this to `["yt_id:", "tt"]`, your addon will only be called for `id` values that start with `yt_id:` or `tt`. If you wish to provide different sets of `idPrefixes` for different resources, see the **ADVANCED** note.
+
+### Advanced
+
+A resource may either be a string (e.g. `"meta"`) or an object of the format `{ name, types, idPrefixes?  }`.
+
+The latter can be used to provide different `types` and `idPrefixes` for a particular resource. Those properties work in the same way as if you put them in the manifest directly.
+
+Keep in mind, `idPrefixes` is always optional, and if you use the full notation without it (e.g. `{ name: "stream", types: ["movie"] }`), this would mean matching on all those types and all possible IDs.
+
+If you just provide a string, the `types` and `idPrefixes` from the manifest will be applied for the resource.
+
+The local addon is an example of a [complex resource description](https://github.com/Stremio/stremio-local-addon/blob/master/lib/manifest.js).
+
+Please note, the `idPrefixes` filtering does not matter for the `"catalog"` resource, since this is a special case that will always be requested if defined in `catalogs`.
+
+## Content catalogs
+
+**NOTE:** Leave this an empty array (``[]``) if your addon does not provide the `catalog` resource.
+
+``catalogs`` - **required** - array of [``Catalog objects``](#catalog-format), a list of the content catalogs your addon provides
+
+### Catalog format
+
+``type`` - **required** - string, this is the content type of the catalog
+
+``id`` - **required** - string, the id of the catalog, can be any unique string describing the catalog (unique per addon, as an addon can have many catalogs), for example: if the catalog name is "Favourite Youtube Videos", the id can be `"fav_youtube_videos"`
+
+``name`` - **required** - string, human readable name of the catalog
+
+``extra`` - _optional_ - array of [``Extra objects``](#extra-properties), all extra properties related to this catalog; should be set to an array of `{ name, isRequired, options, optionsLimit }`
+
+
+#### Extra properties
+
+Stremio can invoke `/catalog/{type}/{id}.json` for catalogs specified in `catalogs` in order to get the feed of [Meta Preview Objects](./meta.md#meta-preview-object).
+
+It can also invoke `/catalog/{type}/{id}/{extraProps}.json` in which case `{extraProps}` will contain other properties such as a search query in order to search the catalog for a list of [Meta Preview Object](./meta.md#meta-preview-object) results.
+
+``extra`` only needs to be set in certain cases, for example, these don't need to be set if your catalog only supports giving a feed of items, but not search them.
+
+If your catalog supports full text searching, set `extra: [{ name: "search", isRequired: false }]`, if your catalog supports filtering by `genre`, set `extra: [{ name: "genre", isRequired: false }]`. But what if your catalog supports only searching, but not giving a feed? Then set `extra: [{ name: "search", isRequired: true }]` and your catalog will only be requested for searching, nothing else.
+
+The format of `extra` is an array of `{ name, isRequired, options, optionsLimit }`, where:
+
+* `name` - **required** - string, is the name of the property; this name will be used in the `extraProps` argument itself
+
+* `isRequired` - _optional_ - boolean, set to true if this property must always be passed
+
+* `options` - _optional_ - array of strings, possible values for this property; this is useful for things like genres, where you need the user to select from a pre-set list of options (e.g. `{ name: "genre", options: ["Action", "Comedy", "Drama"] }`);
+
+* `optionsLimit` - _optional_ - number, the limit of values a user may select from the pre-set `options` list; by default, this is set to 1
+
+
+For a complete list of extra catalog properties that Stremio pays attention to, check the [Catalog Handler Definition](../requests/defineCatalogHandler.md)
+
+If you're looking for the legacy way of setting extra properties (also called "short"), [check out the old docs](https://github.com/Stremio/stremio-addon-sdk/blob/b11bd517f8ce3b24a843de320ec8ac193611e9a0/docs/api/responses/manifest.md#catalog-format)
+
+## Addon catalogs
+
+``addonCatalogs`` - _optional_ - array of [``Catalog objects``](#addon-catalog-format), a list of other addon manifests, this can be used for an addon to act just as a catalog of other addons.
+
+### Addon Catalog format
+
+``type`` - **required** - string, this is the content type of the catalog
+
+``id`` - **required** - string, the id of the catalog, can be any unique string describing the catalog (unique per addon, as an addon can have many catalogs), for example: if the catalog name is "Favourite Youtube Videos", the id can be `"fav_youtube_videos"`
+
+``name`` - **required** - string, human readable name of the catalog
+
+## User data
+
+You can choose to accept user data for your addon, to do this you will need to first set `manifest.behaviorHints.configurable` to `true`, then set the `manifest.config` property.
+
+When setting the `manifest.config` property, the landing page will redirect to `/configure` where there will be an auto-generated configuration page.
+
+***TIP* - you can also set `manifest.behaviorHints.configurationRequired` to state that your addon does not work without user data**
+
+* ``config`` - _optional_ - array of [``Config objects``](#config-format), a list of settings that users can set for your addon
+
+### Config format
+
+``key`` - _required_ - string, a key that will identify the user chosen value
+
+``type`` - _required_ - string, can be "text", "number", "password", "checkbox" or "select"
+
+``default`` - _optional_ - string, the default value, for `type: "boolean"` this can be set to "checked" to default to enabled
+
+``title`` - _optional_ - string, the title of the setting
+
+``options`` - _optional_ - array, the list of (string) choices for `type: "select"`
+
+``required`` - _optional_ - boolean, if the value is required or not, only applies to the following types: "string", "number" (default is `false`)
+
+***TIP* - if you require a more advanced configuration page, you can also [create this page yourself](../../advanced.md#using-user-data-in-addons) instead of using the Addon SDK.**
+
+## Other metadata
+
+``background`` - _optional_ - string, background image for the addon; URL to png/jpg, at least 1024x786 resolution
+
+``logo`` - _optional_ - string, logo icon, URL to png, monochrome, 256x256
+
+``contactEmail`` - _optional_ - string, contact email for addon issues; used for the Report button in the app; also, the Stremio team may reach you on this email for anything relating your addon
+
+``behaviorHints`` - _all are optional_ - object, supports the properties:
+
+- ``adult`` - boolean, if the addon includes adult content, default is `false`; used to provide an adequate warning to the user
+
+- ``p2p`` - boolean, if the addon includes P2P content, such as BitTorrent, which may reveal the user's IP to other streaming parties; used to provide an adequate warning to the user
+
+- ``configurable`` - boolean, default is `false`, if the addon supports settings, will add a button next to "Install" in Stremio that will point to the `/configure` path on the addon's domain, for more information read [User Data](#user-data) (or if you are not using the Addon SDK, read: [Advanced User Data](../../advanced.md#using-user-data-in-addons) and [Creating Addon Configuration Pages](../..//advanced.md#creating-addon-configuration-pages))
+
+- ``configurationRequired`` - boolean, default is `false`, if set to `true` the "Install" button will not show for your addon in Stremio, instead a "Configure" button will show pointing to the `/configure` path on the addon's domain, for more information read [User Data](#user-data) (or if you are not using the Addon SDK, read: [Advanced User Data](../../advanced.md#using-user-data-in-addons) and [Creating Addon Configuration Pages](../..//advanced.md#creating-addon-configuration-pages))
+
+
+***TIP* - to implement sources where streams are geo-restricted, see [``Stream objects``](./stream.md) `geos`**
+
+
+## Example
+
+```javascript
+{           
+    "id": "org.stremio.example",
+    "version": "0.0.1",
+    "description": "Example Stremio Addon",
+    "name": "Example Addon",
+    "resources": [
+        "catalog",
+        "stream"
+    ],
+    "types": [
+        "movie",
+        "series"
+    ],
+    "catalogs": [
+        {
+            "type": "movie",
+            "id": "moviecatalog"
+        }
+    ],
+    "idPrefixes": ["tt"]
+}
+```
+
+This manifest example is for an addon that:
+- provides streams and catalogs
+- has one catalog that includes movies
+- will receive stream requests for meta items that have an id that starts with `tt` (imdb id, example: `tt0068646`), for both movies and series
+
+For more examples of addon manifests, see:
+
+* https://github.com/Stremio/stremio-local-addon/blob/master/lib/manifest.js
+* https://stremio-public-domain-foreign.now.sh/manifest.json
+* https://v3-cinemeta.strem.io/manifest.json
+
+
+
+---
+File: /docs/api/responses/meta.links.md
+---
+
+## Meta Links
+
+**Stremio supports the following meta links as of Dec 2019:**
+
+* ``stremio:///search?search=${query}`` - opens the Search page with the set `${query}`
+
+* ``stremio:///discover/${transportUrl}/${type}/${catalogId}?${extra}`` - opens the Discover page for the addon that has `${transportUrl}` (URL to an addon's [``Manifest``](./manifest.md)), with the [``Catalog``](./manifest.md#catalog-format) which has the id `${catalogId}` and the type `${type}`, the `?${extra}` is optional and refers to [``Catalog Extra Parameters``](../requests/defineCatalogHandler.md#extra-parameters) that should be passed as a [``Query String``](https://en.wikipedia.org/wiki/Query_string)
+
+* ``stremio:///detail/${type}/${id}`` - opens the Detail page for the [``Meta Object``](./meta.md) with the id `${id}` and the type `${type}`
+
+* ``stremio:///detail/${type}/${id}/${videoId}`` - opens the Detail page with Streams open for the [``Video``](./meta.md#video-object) with the id `${videoId}` for the [``Meta Object``](./meta.md) with the id `${id}` and the type `${type}`
+
+**If you think Stremio should add another meta link, feel free to open an issue on this repository.**
+
+
+
+---
+File: /docs/api/responses/meta.md
+---
+
+## Meta Object
+
+Used as a response for [`defineMetaHandler`](../requests/defineMetaHandler.md)
+
+``id`` - **required** - string, universal identifier; you may use a [prefix](./manifest.md##filtering-properties) unique to your addon, for example `yt_id:UCrDkAvwZum-UTjHmzDI2iIw`
+
+``type`` - **required** - string, type of the content; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](./content.types.md))
+
+``name`` - **required** - string, name of the content
+
+``genres`` - _optional_  - array of strings, genre/categories of the content; e.g. ``["Thriller", "Horror"]`` (warning: this will soon be deprecated in favor of ``links``)
+
+``poster`` - _optional_ - string, URL to png of poster; accepted aspect ratios: 1:0.675 (IMDb poster type) or 1:1 (square) ; you can use any resolution, as long as the file size is below 100kb; below 50kb is recommended
+
+``posterShape`` - _optional_ - string, can be `square` (1:1 aspect) or `poster` (1:0.675) or `landscape` (1:1.77). If you don't pass this, `poster` is assumed
+
+``background`` - _optional_ - string, the background shown on the stremio detail page ; heavily encouraged if you want your content to look good; URL to PNG, max file size 500kb
+
+``logo`` - _optional_ - string, the logo shown on the stremio detail page ; encouraged if you want your content to look good; URL to PNG
+
+``description`` - _optional_ - string, a few sentences describing your content
+
+``releaseInfo`` - _optional_ - string, year the content came out ; if it's ``series`` or ``channel``, use a start and end years split by a tide - e.g. ``"2000-2014"``. If it's still running, use a format like ``"2000-"``
+
+``director``, ``cast`` - _optional_  - directors and cast, both arrays of names (string) (warning: this will soon be deprecated in favor of ``links``)
+
+``imdbRating`` -  _optional_ - string, IMDb rating, a number from 0.0 to 10.0 ; use if applicable
+
+``released`` - _optional_ - string, ISO 8601, initial release date; for movies, this is the cinema debut, e.g. "2010-12-06T05:00:00.000Z"
+
+``trailers`` - _optional_ - array, containing objects in the form of `{ "source": "P6AaSMfXHbA", "type": "Trailer" }`, where `source` is a YouTube Video ID and `type` can be either `Trailer` or `Clip` (warning: this will soon be deprecated in favor of `meta.trailers` being an array of [``Stream Objects``](./stream.md))
+
+``links`` - _optional_ - array of [``Meta Link objects``](#meta-link-object), can be used to link to internal pages of Stremio, example usage: array of actor / genre / director links
+
+``videos`` - _optional_ - array of [``Video objects``](#video-object), used for ``channel`` and ``series``; if you do not provide this (e.g. for ``movie``), Stremio assumes this meta item has one video, and it's ID is equal to the meta item `id`
+
+``runtime`` - _optional_ - string, human-readable expected runtime - e.g. "120m"
+
+``language`` - _optional_ - string, spoken language
+
+``country`` - _optional_ - string, official country of origin
+
+``awards`` - _optional_ - string, human-readable that describes all the significant awards
+
+``website`` - _optional_ - string, URL to official website
+
+``behaviorHints`` - _all are optional_ - object, supports the properties:
+
+- ``defaultVideoId`` - string, set to a [``Video Object``](#video-object) id in order to open the Detail page directly to that video's streams
+
+
+#### Meta Link object
+
+``name`` - **required** - string, human readable name for the link
+
+``category`` - **required** - string, any unique category name, links are grouped based on their category, some recommended categories are: `actor`, `director`, `writer`, while the following categories are reserved and should not be used: `imdb`, `share`, `similar`
+
+``url`` - **required** - string, an external URL or [``Meta Link``](./meta.links.md)
+
+
+#### Video object
+
+``id`` - **required** - string, ID of the video
+
+``title`` - **required** - string, title of the video
+
+``released`` - **required** - string, ISO 8601, publish date of the video; for episodes, this should be the initial air date, e.g. "2010-12-06T05:00:00.000Z"
+
+``thumbnail`` - _optional_ - string, URL to png of the video thumbnail, in the video's aspect ratio, max file size 5kb
+
+``streams`` - _optional_ - array of [``Stream Objects``](./stream.md), in case you can return links to streams while forming meta response, **you can pass and array of [``Stream Objects``](./stream.md)** to point the video to a HTTP URL, BitTorrent, YouTube or any other stremio-supported transport protocol; note that this is exclusive: passing `video.streams` means that **Stremio will not** request any streams from other addons for that video; if you return streams that way, it is still recommended to implement the `streams` resource
+
+``available`` - _optional_ - boolean, set to ``true`` to explicitly state that this video is available for streaming, from your addon; no need to use this if you've passed ``streams``
+
+``episode`` - _optional_ - number, episode number, if applicable
+
+``season`` - _optional_ - number, season number, if applicable
+
+``trailers`` - _optional_ - array, containing [``Stream Objects``](./stream.md)
+
+``overview`` - _optional_ - string, video overview/summary
+
+
+##### Video object - series example
+
+```javascript
+{
+    id: "tt0108778:1:1",
+    title: "Pilot",
+    released: new Date("1994-09-22 20:00 UTC+02"),
+    season: 1,
+    episode: 1,
+    overview: "Monica and the gang introduce Rachel to the real world after she leaves her fiancé at the altar."
+}
+```
+
+You can see a comprehensive example of how detailed Meta objects with videos are returned [here, on the Cinemeta addon](https://v3-cinemeta.strem.io/meta/series/tt0386676/lastVideos=1.json)
+
+##### Video object - YouTube video example (channels)
+
+
+```javascript
+{
+    id: "yt_id:UCrDkAvwZum-UTjHmzDI2iIw:9bZkp7q19f0",
+    title: "PSY - GANGNAM STYLE",
+    released: new Date("2012-07-15 20:00 UTC+02"),
+    thumbnail: "https://i.ytimg.com/vi/9bZkp7q19f0/hqdefault.jpg"
+}
+```
+
+## Meta Preview Object
+
+This is a shorter variant of the previously described [Meta Object](#meta-object)
+
+Used as a response for [`defineCatalogHandler`](../requests/defineCatalogHandler.md)
+
+``id`` - **required** - string, universal identifier; you may use a [prefix](./manifest.md##filtering-properties) unique to your addon, for example `yt_id:UCrDkAvwZum-UTjHmzDI2iIw`
+
+``type`` - **required** - string, type of the content; e.g. `movie`, `series`, `channel`, `tv` (see [Content Types](./content.types.md))
+
+``name`` - **required** - string, name of the content
+
+``poster`` - **required** - string, URL to png of poster; accepted aspect ratios: 1:0.675 (IMDb poster type) or 1:1 (square); you can use any resolution, as long as the file size is below 100kb; below 50kb is recommended; also used as the background shown on the stremio discover page in the sidebar
+
+``posterShape`` - _optional_ - string, can be `square` (1:1 aspect) or `poster` (1:0.675) or `landscape` (1:1.77). If you don't pass this, `poster` is assumed
+
+#### Additional Parameters that are used for the Discover Page Sidebar:
+
+``genres`` - _optional_  - array of strings, genre/categories of the content; e.g. ``["Thriller", "Horror"]`` (warning: this will soon be deprecated in favor of ``links``)
+
+``imdbRating`` -  _optional_ - string, IMDb rating, a number from 0.0 to 10.0 ; use if applicable
+
+``releaseInfo`` - _optional_ - string, year the content came out ; if it's ``series`` or ``channel``, use a start and end years split by a tide - e.g. ``"2000-2014"``. If it's still running, use a format like ``"2000-"``
+
+``director``, ``cast`` - _optional_  - directors and cast, both arrays of names (string) (warning: this will soon be deprecated in favor of ``links``)
+
+``links`` - _optional_ - array of [``Meta Link objects``](#meta-link-object), can be used to link to internal pages of Stremio, example usage: array of actor / genre / director links
+
+``description`` - _optional_ - string, a few sentances describing your content
+
+``trailers`` - _optional_ - array, containing objects in the form of `{ "source": "P6AaSMfXHbA", "type": "Trailer" }`, where `source` is a YouTube Video ID and `type` can be either `Trailer` or `Clip` (warning: this will soon be deprecated in favor of `meta.trailers` being an array of [``Stream Objects``](./stream.md))
+
+
+
+---
+File: /docs/api/responses/stream.md
+---
+
+## Stream Object
+
+Used as a response for [`defineStreamHandler`](../requests/defineStreamHandler.md)
+
+**One of the following must be passed** to point to the stream itself
+
+* ``url`` - string, direct URL to a video stream - must be an MP4 through https; others supported (other video formats over http/rtmp supported if you set `notWebReady`)
+* ``ytId`` - string, youtube video ID, plays using the built-in YouTube player
+* ``infoHash`` - string, info hash of a torrent file, and `fileIdx` is the index of the video file within the torrent; **if fileIdx is not specified, the largest file in the torrent will be selected**
+* ``fileIdx`` - number, the index of the video file within the torrent (from `infoHash`); **if fileIdx is not specified, the largest file in the torrent will be selected**
+* ``externalUrl`` - string, [``Meta Link``](./meta.links.md) or an external URL to the video, which should be opened in a browser (webpage), e.g. link to Netflix
+
+### Additional properties to provide information / behaviour flags
+
+- ``name`` - _optional_ - string, name of the stream; usually used for stream quality
+
+- ``title`` - _optional_ - string, description of the stream (warning: this will soon be deprecated in favor of `stream.description`)
+
+- ``description`` - _optional_ - string, description of the stream (previously `stream.title`)
+
+- ``subtitles`` - _optional_ - array of [``Subtitle objects``](./subtitles.md) representing subtitles for this stream
+
+- ``sources`` - _optional_ - array of strings, represents a list of torrent tracker URLs and DHT network nodes. This attribute can be used to provide additional peer discovery options when `infoHash` is also specified, but it is not required. If used, each element can be a tracker URL (`tracker:<protocol>://<host>:<port>`) where `<protocol>` can be either `http` or `udp`. A DHT node (`dht:<node_id/info_hash>`) can also be included.
+  > **WARNING**: Use of DHT may be prohibited by some private trackers as it exposes torrent activity to a broader network, potentially finding more peers.
+
+- `behaviorHints` (all are optional)
+    - `countryWhitelist`: which hints it's restricted to particular countries  - array of ISO 3166-1 alpha-3 country codes **in lowercase** in which the stream is accessible
+    - `notWebReady`: applies if the protocol of the url is http(s); needs to be set to `true` if the URL does not support https or is not an MP4 file
+    - `bingeGroup`: if defined, addons with the same `behaviorHints.bingeGroup` will be chosen automatically for binge watching; this should be something that identifies the stream's nature within your addon: for example, if your addon is called "gobsAddon", and the stream is 720p, the bingeGroup should be "gobsAddon-720p"; if the next episode has a stream with the same `bingeGroup`, stremio should select that stream implicitly
+    - `proxyHeaders`: only applies to `url`s; **When using this property, you must also set `stream.behaviorHints.notWebReady: true`**; This is an object containing `request` and `response` which include the headers that should be used for the stream (example value: `{ "request": { "User-Agent": "Stremio" } }`)
+    - `videoHash`: - string, the calculated [OpenSubtitles hash](http://trac.opensubtitles.org/projects/opensubtitles/wiki/HashSourceCodes) of the video, this will be used when the streaming server is not connected (so the hash cannot be calculated locally), this value is passed to subtitle addons to identify correct subtitles
+    - `videoSize`: - number, size of the video file in bytes, this value is passed to the subtitle addons to identify correct subtitles
+    - `filename`: - string, filename of the video file, although optional, it is highly recommended to set it when using `stream.url` (when possible) in order to identify correct subtitles (addon sdk will show a warning if it is not set in this case), this value is passed to the subtitle addons to identify correct subtitles
+
+
+
+---
+File: /docs/api/responses/subtitles.md
+---
+
+## Subtitles Object
+
+Used as a response for [`defineSubtitlesHandler`](../requests/defineSubtitlesHandler.md)
+
+``id`` - **required** - string, unique identifier for each subtitle, if you have more than one subtitle with the same language, the id will differentiate them
+
+``url`` - **required** - string, url to the subtitle file
+
+``lang`` - **required** - string, language code for the subtitle, if a valid ISO 639-2 code is not sent, the text of this value will be used instead
+
+
+### Tips
+
+- When creating subtitle addons, incorrectly encoded subtitles may be an issue, in this case you can set the `url` response to `http://127.0.0.1:11470/subtitles.vtt?from=` followed by the URL to the subtitle file, this will force the local streaming server to guess the subtitle encoding when loading it
+- You can also link to subtitle files from inside torrents, but you need to know the file index of the subtitle files from the torrent file list. An example of a link pointing to a subtitle inside a torrent is `http://127.0.0.1:11470/6366e0a6d44d49c8fa09c04669375c024e42bf7e/3`, where `6366e0a6d44d49c8fa09c04669375c024e42bf7e` is the torrent infohash, and `3` is the file index of the subtitle file in the torrent. When linking to subtitle files inside torrents it is recommended to use the `subtitles` property from the [Stream Object](./stream.md)
+
+
+
+---
+File: /docs/api/README.md
+---
+
+# Resources
+
+In order for Stremio to display addon data, the addon must first supply the resource for it. There are different types of resources, the only mandatory resource is the `manifest`, addons can choose to supply either one or more of the other available resources.
+
+
+| **Resource**  | **Handler** | **Response** | **Description** |
+| ------------- | ------------- | ------------- | ------------- |
+| **manifest** | - | [manifest](./responses/manifest.md) | The addon description and capabilities. |
+| **catalog** | [defineCatalogHandler](./requests/defineCatalogHandler.md) | [meta_preview](./responses/meta.md#meta-preview-object) | Summarized collection of meta preview items. Catalogs are displayed on the Stremio's Board, Discover and Search. |
+| **metadata** | [defineMetaHandler](./requests/defineMetaHandler.md) | [meta](./responses/meta.md) | Detailed description of meta item. This description is displayed when the user selects an item form the catalog. |
+| **streams** | [defineStreamHandler](./requests/defineStreamHandler.md) | [stream](./responses/stream.md) | Tells Stremio how to obtain the media content. It may be torrent info hash, HTTP URL, etc |
+| **subtitles** | [defineSubtitlesHandler](./requests/defineSubtitlesHandler.md) | [subtitles](./responses/subtitles.md) | Subtitles resource for the chosen media. |
+| **addon_catalog** | [defineResourceHandler](./requests/defineResourceHandler.md) | [addon_catalog](./responses/addon_catalog.md) | A catalog (list) of other addon manifests. |
+
+
+The structure of those resources in Stremio is as follows:
+
+```
++-- Catalog
+    +-- Meta Item
+        +-- Videos (part of Meta Item)
+        +---+-- Streams
+        +---+---+-- Subtitles
+```
+
+When the user opens the Discover/Board section, catalogs from all installed addons are loaded. Catalog responses include [meta preview objects](./responses/meta.md#meta-preview-object), which are just stripped down versions of the full meta object.
+
+Once a user clicks on a specific item, the Detail page is opened, and the full meta object is loaded by requesting all relevant (see [filtering](#filtering)) addons.
+
+Then, the user will pick a video (e.g. episode) from that meta object, which will trigger loading streams from all relevant addons. If the meta item has only one video object (as is the case with movies), streams will be requested as soon as the Detail page is opened.
+
+
+## Filtering
+
+We determine whether an addon is relevant by comparing the request against it's manifest.
+
+For catalogs, we usually request all catalogs from all addons, that are compatible with the `extra` properties that we're looking for. For example, to load the Board, we'd load all catalogs that have no `extra` properties that are required. But, if we're loading Search, we'd load all catalogs that have `search` as a supported property in their `extra` definition.
+
+For other requests (meta, stream, subtitles), we apply the `types` and the optional `idPrefixes` filters (which can also be defined per-resource). For example, for `/meta/movie/tt1254207`, we'd try to load meta from all addons that have `"movie"` in `manifest.types` (or have `{ name: "meta", types: ["movie'] }` in `manifest.resources`). If `manifest.idPrefixes` is defined, `["tt"]` will match this request, but something different (e.g. `["yt_id:"]`) won't. This helps you ensure your addon does not get irrelevant requests.
+
+For the full spec, see [manifest - filtering properties](./responses/manifest.md#filtering-properties).
+
+
+
+---
+File: /docs/deploying/beamup.md
+---
+
+# Deploying to Beamup
+
+## Prerequisites
+
+In order to deploy you will need:
+- [Node.js](https://nodejs.org/en/download/) installed on your system
+- a GitHub account
+- your SSH key added to your GitHub account
+
+## Install the Client
+
+- `npm install beamup-cli -g`
+
+## Usage
+
+- go to the project directory that you want to deploy
+- use the `beamup` command
+
+The `beamup` command is a universal command, it will handle both initial setup and deploying projects.
+
+## One Time Setup
+
+When you run `beamup` for the first time, it will:
+- ask you for a host, use `a.baby-beamup.club`
+- ask you for your GitHub username
+
+Once you've added this information, it will save it and not ask you again. If you ever want to change these settings, use `beamup config`.
+
+### Good to Know
+
+- you can use `git push beamup master` to update your projects as well
+- your project must support using the `PORT` process environment variable (if available) as the http server port
+- your project repo must suppport one of the Heroku buildpacks or must have a `Dockerfile`; with Nodejs, simply having a `package.json` in the repo should be sufficient
+- it's based on [Dokku](http://dokku.viewdocs.io/dokku/), so whatever you can deploy there you can also deploy on Beamup (it's using the same build system); however, some features are not supported such as custom NGINX config
+- currently only projects using Dokku 'Herokuish' buildpack are supported; an ugly workaround to deploy a project built with Dokku 'Dockerfile' buildpack is to include 'docker' in the project name
+- the Node.js dependency can be avoided by downloading a prebuilt version of `beamup-cli` from the [releases page](https://github.com/Stremio/stremio-beamup-cli/releases/)
+- Beamup supports any programming language, the use of Node.js is not a requirement to build the addon
+
+
+
+---
+File: /docs/deploying/glitch.md
+---
+
+# Deploying to Glitch with CloudFlare
+
+The plan:
+- deploy your node.js addon to [Glitch.com](https://glitch.com)
+- create a free domain (for 12 months) on [my.ga](https://my.ga)
+- use [Fly.io](https://fly.io) to connect the custom domain to the glitch project
+- use [CloudFlare](https://cloudflare.com) to cache the addon responses
+
+
+## 1. Deploying to Glitch.com
+
+[Glitch](https://glitch.com) offers 4000 requests per hour and sends your app to sleep after 5 minutes of inactivity.
+
+Deploying to Glitch takes seconds if you have your addon on GitHub, just go on the site, create a new user (if you don't have one already), and import your project based on your Github's Git link (find it by pressing the "Clone or download" button on your Github's project page)
+
+A few pointers:
+- use `process.env.PORT` as your HTTP server's port
+- you can avoid letting your app go to sleep (which is recommended), by using:
+```javascript
+const https = require('https')
+
+setInterval(() => {
+	https.get('https://my-project.glitch.me/manifest.json')
+}, 299000)
+```
+and replacing `my-project` in the URL with your own glitch project name
+
+
+## 2. Create a free domain on my.ga
+
+Go to [my.ga](https://my.ga) and create a new free domain, once you go to the cart, make sure to select "12 Months", as the page uses "3 Months" by default.
+
+Don't set any redirect or DNS settings for now, continue on the page and create an account if you don't have one.
+
+
+## 3. Use Fly.io to connect a custom domain to Glitch
+
+Go on [Fly.io](https://fly.io) and create an account if you don't have one, after you are logged in, go to [this page](https://fly.io/sites) (this page shows a 404 error if you are not logged in) and press "Add New Site".
+
+Select "Glitch" and enter your Glitch project Live URL. This will bring you to a page that asks you to set DNS records, keep this page open and continue with the tutorial.
+
+
+## 4. Use CloudFlare to cache the addon responses
+
+Go to [CloudFlare](cloudflare.com) and create a new account if you don't have one. Then add a new site with the .ga domain you registered in Step 2, CloudFlare will tell you that it couldn't find any DNS records for it, don't worry, that's fine. Create a new CNAME record with the Name set to `@` and the Target set to what the page from Step 3 shows next to CNAME (it should be a URL that ends with `.shw.io`). Now press "Add Rule" and confirm the changes.
+
+This will bring you to a page that tells you to change your domain's nameservers, to do that, go to [Freenom](https://freenom.com) (where you made your .ga domain), log in with the account you used to create your domain, in the top menu press "Services", then "My Domains", then "Manage Domain" next to your domain name, now press "Management Tools", then "Nameservers", press "Use custom nameservers" and paste your CloudFlare nameservers.
+
+Now go back to the Fly.io page from Step 3 and press "Next". With this done, CloudFlare is now connected to Fly.io, which is connected to your Glitch project.
+
+There's one more thing to do, CloudFlare doesn't cache JSON by default, so we need to create a Page Rule for that. Go to your CloudFlare account, select your .ga domain, press "Page Rules" (from the top menu), press "Create Page Rule", in the top input field write your domain name and end it with `/*`, then press "+ Add a Setting", select "Cache Level", then select "Cache Everything".
+
+You're done!
+
+
+---
+File: /docs/deploying/now.md
+---
+
+# Deploying to Now.sh with Caching
+
+The plan:
+- deploy to [Now.sh](https://now.sh) with serverless
+- use Now.sh CDN cache
+
+# 1. Deploying to Now.sh
+
+First let's make sure your project is serverless. 
+
+Presuming your code is in `index.js`, instead of ending your code with `addon.serveHTTP`, use:
+
+```javascript
+module.exports = addon.getInterface()
+```
+
+where `addon` is:
+```javascript
+const { addonBuilder } = require("stremio-addon-sdk")
+const addon = new addonBuilder(manifest);
+```
+
+Create `serverless.js`, which includes:
+
+```javascript
+const { getRouter } = require("stremio-addon-sdk");
+const addonInterface = require("./addon");
+const router = getRouter(addonInterface);
+module.exports = function(req, res) {
+    router(req, res, function() {
+        res.statusCode = 404;
+        res.end();
+    });
+}
+```
+
+Create a `now.json` file that includes:
+
+```json
+{
+    "version": 2,
+    "builds": [
+        { "src": "serverless.js", "use": "@now/node" }
+    ],
+    "routes": [
+        { "src": "/.*", "dest": "/serverless.js" }
+    ]
+}
+```
+
+Now go to [now.sh](https://now.sh) and create an account if you don't have one, then install the `now` cli tool with:
+```
+npm install -g now
+```
+
+Open a terminal window, go to your project's directory and simply write `now`, this will prompt for login, after you login you'll get your Now.sh URL.
+
+
+## 2. Use Now.sh CDN Caching
+
+It is important to set the `cacheMaxAge` parameter in the responses with the number of seconds you want the responses cached by Now.sh's CDN. Caching is important to reduce the number of requests and ensuring the longevity of your addon.
+
+The `cacheMaxAge` parameter is documented for all [request handlers](../api/requests).
+
+You're done!
+
+
+---
+File: /docs/deploying/README.md
+---
+
+## Deploying your Addon
+
+**Note:** Although deploying is recommended, there is also the alternative of using [localtunnel](https://github.com/localtunnel/localtunnel) to host your addons locally.
+
+Stremio addons require hosting in order to be published. You will need a NodeJS hosting solution, as Stremio Addons made with the Stremio Addon SDK are NodeJS apps.
+
+We recommend:
+
+- [Beamup](./beamup.md) - free
+- [Heroku](https://www.heroku.com) - [free with some restrictions](https://www.heroku.com/pricing)
+- [Fleek](https://fleek.co/) - [free with some restricitions](https://fleek.co/pricing/)
+- [Glitch](https://glitch.com/) - [free with some restrictions](https://glitch.com/help/restrictions/)
+- [cloudno.de](https://cloudno.de) - [free for up to 150k requests/month](https://cloudno.de/pricing)
+- [Evennode](https://www.evennode.com) - [free for 7 days trial](https://www.evennode.com/pricing)
+
+You can also check this very comprehensive [guide by nodejs](https://github.com/nodejs/node-v0.x-archive/wiki/node-hosting).
+
+Stremio addons are deployed just like regular nodejs apps, so follow the nodejs instructions provided by your particular service provider.
+
+If you've built a great addon, and need help with hosting your addon, you are welcome to contact us at [addons@stremio.com](addons@stremio.com)
+
+**NOTE:** we used to recommend now.sh, but after getting reports from multiple developers of now.sh suspending accounts without good reason, we no longer recommend it
+
+### Publishing to Stremio
+
+If you want your addon to appear in the list of Community addons in Stremio, check out [publishToCentral](../README.md#publishtocentralurl)
+
+If you are not using the Addon SDK to create your addon, you can publish your addon in the list of Community addons in Stremio by submitting it on [this site](https://stremio.github.io/stremio-publish-addon/index.html)
+
+### Guides
+
+- [Deploying to Beamup](./beamup.md)
+- [Deploying to Glitch.com with CloudFlare](./glitch.md)
+- [Deploying to Now.sh with CloudFlare](./now.md) - note that deploying to now.sh is no longer recommended, but this guide includes useful information applicable for other serverless platforms
+
+
+
+---
+File: /docs/advanced.md
+---
+
+# Advanced Usage
+
+- [Understanding Catalogs](#understanding-catalogs) (searching, filtering, paginating)
+- [Understanding Cinemeta](#understanding-cinemeta)
+- [Adding Stream Results to Cinemeta Items](#adding-stream-results-to-cinemeta-items)
+- [Getting Metadata from Cinemeta](#getting-metadata-from-cinemeta)
+- [Resolving Movie / Series names to IMDB ID](#resolving-movie--series-names-to-imdb-id)
+- [Using User Data in Addons](#using-user-data-in-addons)
+- [Using Deep Links in Addons](#using-deep-links-in-addons)
+- [Proxying Other Addons](#proxying-other-addons)
+- [Crawler (Scraping) Addons](#crawler--scraping-addons)
+
+
+## Understanding Catalogs
+
+The `catalog` resource in Stremio addons can be used to:
+- show one or more catalogs in the Board and Discover pages, these responses can also be filtered and paginated
+- show search results from catalogs
+
+Let's first look at how `catalog` is declared in the [manifest](./api/responses/manifest.md):
+```json
+{
+  "resources": ["catalog"],
+  "catalogs": [
+    {
+      "id": "testcatalog",
+      "type": "movie"      
+    }
+  ]
+}
+```
+
+This is normally all you'd need to make a standard catalog, but it won't support filtering, paginating and it won't be searchable.
+
+
+### Searching in Catalogs
+
+To state that your catalog supports searching, you'd need to set it in the `extra` property:
+
+```json
+catalogs: [
+  {
+    "id": "testcatalog",
+    "type": "movie",
+    "extra": [
+      {
+        "name": "search",
+        "isRequired": false
+      }
+    ]
+  }
+]
+```
+
+But then, what if you want your catalog to support only search (as in, not show in the Board or Discover pages at all)?
+
+Then you'd need to state that your catalog supports only searching, and you can do that with:
+
+```json
+catalogs: [
+  {
+    "id": "testcatalog",
+    "type": "movie",
+    "extra": [
+      {
+        "name": "search",
+        "isRequired": true
+      }
+    ]
+  }
+]
+```
+
+Once you've set `search` in `extra`, your catalog handler will receive `args.extra.search` as the search query (if it is a search request), so here's an example of a search response:
+
+```javascript
+const meta = {
+  id: 'tt1254207',
+  name: 'Big Buck Bunny',
+  releaseInfo: '2008',
+  poster: 'https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg',
+  posterShape: 'poster',
+  banner: 'https://image.tmdb.org/t/p/original/aHLST0g8sOE1ixCxRDgM35SKwwp.jpg',
+  type: 'movie'
+}
+builder.defineCatalogHandler(function(args) {
+  return new Promise(function(resolve, reject) {
+    if (args.id == 'testcatalog') {
+      // this is a request to our catalog id
+      if (args.extra.search) {
+        // this is a search request
+        if (args.extra.search == 'big buck bunny') {
+          // if someone searched for "big buck bunny" (exact match)
+          // respond with our meta item
+          resolve({ metas: [meta] })
+        } else {
+          reject(new Error('No search results found'))
+        }
+      } else {
+        // this is a standard catalog request
+        // just respond with our meta item
+        resolve({ metas: [meta] })
+      }
+    } else {
+      reject(new Error('Unknown catalog request'))
+    }
+  })
+})
+```
+
+
+### Filtering in Catalogs
+
+Maybe you would like your catalog to be filtered by `genre`, in this case, we'll set that in the catalog definition:
+
+```json
+catalogs: [
+  {
+    "id": "testcatalog",
+    "type": "movie",
+    "extra": [
+      {
+        "name": "genre",
+        "options": [ "Drama", "Action" ],
+        "isRequired": false
+      }
+    ]
+  }
+]
+```
+
+Now we'll receive `genre` in our catalog handler:
+
+```javascript
+const meta = {
+  id: 'tt1254207',
+  name: 'Big Buck Bunny',
+  releaseInfo: '2008',
+  poster: 'https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg',
+  posterShape: 'poster',
+  banner: 'https://image.tmdb.org/t/p/original/aHLST0g8sOE1ixCxRDgM35SKwwp.jpg',
+  type: 'movie'
+}
+builder.defineCatalogHandler(function(args) {
+  return new Promise(function(resolve, reject) {
+    if (args.id == 'testcatalog') {
+      // this is a request to our catalog id
+      if (args.extra.genre) {
+        // this is a filter request
+        if (args.extra.genre == "Action") {
+          // in this example we'll only respon with our
+          // meta item if the genre is "Action"
+          resolve({ metas: [meta] })
+        } else {
+          // otherwise with no meta item
+          resolve({ metas: [] })
+        }
+      } else {
+        // this is a standard catalog request
+        // just respond with our meta item
+        resolve({ metas: [meta] })
+      }
+    } else {
+      reject(new Error('Unknown catalog request'))
+    }
+  })
+})
+```
+
+
+## Pagination in Catalogs
+
+If we want our catalogs to be paginated, we can use `skip` as follows:
+
+```json
+catalogs: [
+  {
+    "id": "testcatalog",
+    "type": "movie",
+    "extra": [
+      {
+        "name": "skip",
+        "isRequired": false
+      }
+    ]
+  }
+]
+```
+
+Optionally, we can also set the steps in which the catalog will request the next items, for example:
+
+```json
+catalogs: [
+  {
+    "id": "testcatalog",
+    "type": "movie",
+    "extra": [
+      {
+        "name": "skip",
+        "options": ["0", "100", "200"],
+        "isRequired": false
+      }
+    ]
+  }
+]
+```
+
+This is not a requirement though, as if we don't set `options` Stremio will request `skip` once it comes to the end of your catalog.
+
+Here's an example of using `skip`:
+
+```javascript
+// we only have one meta item
+const meta = {
+  id: 'tt1254207',
+  name: 'Big Buck Bunny',
+  releaseInfo: '2008',
+  poster: 'https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg',
+  posterShape: 'poster',
+  banner: 'https://image.tmdb.org/t/p/original/aHLST0g8sOE1ixCxRDgM35SKwwp.jpg',
+  type: 'movie'
+}
+
+const metaList = []
+
+// but we'll make an array that includes our meta 60 times
+for (let i = 0; i++; i < 60) {
+  metaList.push(meta)
+}
+
+builder.defineCatalogHandler(function(args) {
+  return new Promise(function(resolve, reject) {
+    if (args.id == 'testcatalog') {
+      // we'll slice our meta list using
+      // skip as the starting point
+      const skip = args.extra.skip || 0
+      resolve({ metas: metaList.slice(skip, skip + 20) })
+    } else {
+      reject(new Error('Unknown catalog request'))
+    }
+  })
+})
+```
+
+
+## Understanding Cinemeta
+
+Cinemeta is the primary addon that Stremio uses to show Movie, Series and Anime items. Other addons can choose to create their own catalogs of items or respond with streams to the Cinemeta items.
+
+Cinemeta uses IMDB IDs for their metadata, to understand it's pattern:
+- `tt0111161` is the meta ID (and video ID) of a movie
+- `tt3107288` is the meta ID of a series, and `tt3107288:1:1` is the video ID for season 1, episode 1 of the series with the `tt3107288` meta ID
+
+
+## Adding Stream Results to Cinemeta Items
+
+To add only stream results to Cinemeta items, you will first need to state that your addons id prefix is `tt` (as for IMDB IDs).
+
+Add these to your [manifest](./api/responses/manifest.md):
+- `resources: ["stream"]`
+- `idPrefixes: ["tt"]`
+
+Now here is an example of returning stream responses for Cinemeta items:
+
+```javascript
+builder.defineStreamHandler(function(args) {
+  return new Promise(function(resolve, reject) {
+    if (args.type === 'movie' && args.id === 'tt1254207') {
+      // serve one stream for big buck bunny
+      const stream = { url: 'http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4' }
+      resolve({ streams: [stream] })
+    } else if (args.type === 'series' && args.id === 'tt8633518:1:1') {
+      // return one stream for the series Weird City, Season 1 Episode 1
+      // (free Youtube Originals series)
+      const stream = { id: 'yt_id::fMnq5v8yZp4' }
+      resolve({ streams: [stream] })
+    } else {
+      reject(new Error('No streams available for: ' + args.id))
+    }
+  })
+})
+```
+
+
+## Getting Metadata from Cinemeta
+
+There might be cases where you would need metadata based on IMDB ID. To do this, you will need both IMDB ID and the type of the item (either `movie` or `series`).
+
+Because Cinemeta is also an addon, you can request the metadata from it.
+
+Here is an example using `needle` to do a HTTP request to Cinemeta for metadata:
+
+```javascript
+var needle = require('needle')
+
+// we will get metadata for the movie: Big Buck Bunny
+
+var itemType = 'movie'
+var itemImdbId = 'tt1254207'
+
+needle.get('https://v3-cinemeta.strem.io/meta/' + itemType + '/' + itemImdbId + '.json', function(err, resp, body) {
+
+  if (body && body.meta) {
+
+    // log Big Buck Bunny's metadata
+    console.log(body.meta)
+
+  }
+
+})
+```
+
+
+## Resolving Movie / Series names to IMDB ID
+
+What if you have a movie or series name, but you need it's IMDB ID?
+
+We recommend using [name-to-imdb](https://github.com/Ivshti/name-to-imdb) in this case, and it's really easy to use:
+
+```javascript
+var nameToImdb = require("name-to-imdb");
+
+nameToImdb({ name: "south park" }, function(err, res, inf) { 
+  console.log(res); // prints "tt0121955"
+  console.log(inf); // inf contains info on where we matched that name - e.g. metadata, or on imdb
+})
+```
+
+Also setting the `type` and `year` in the request helps on ensuring that the IMDB ID that is returned is correct.
+
+
+## Using User Data in Addons
+
+**The Addon SDK now [supports user data](./api/responses/manifest.md#user-data), this part of the docs will remain here as it is valid for use with the Express module.**
+
+This example does not use the Stremio Addon SDK, it uses Node.js and Express to serve replies.
+
+User data is passed in the Addon Repository URL, so instead of users installing addons from the normal manifest url (for example: `https://www.mydomain.com/manifest.json`), users will also need to add the data they want to pass to the addon in the URL (for example: `https://www.mydomain.com/c9y2kz0c26c3w4csaqne71eu4jqko7e1/manifest.json`, where `c9y2kz0c26c3w4csaqne71eu4jqko7e1` could be their API Authentication Token)
+
+Simplistic Example:
+
+```javascript
+const express = require('express')
+const addon = express()
+
+addon.get('/:someParameter/manifest.json', function (req, res) {
+  res.send({
+    id: 'org.parameterized.'+req.params.someParameter,
+    name: 'addon for '+req.params.someParameter,
+    resources: ['stream'],
+    types: ['series'],
+  })
+})
+
+addon.get('/:someParameter/stream/:type/:id.json', function(req, res) {
+  // @TODO do something depending on req.params.someParameter
+  res.send({ streams: [] })
+})
+
+addon.listen(7000, function() {
+  console.log('http://127.0.0.1:7000/[someParameter]/manifest.json')
+})
+```
+
+This is not a working example, it simply shows how data can be inserted by users in the Addon Repository URL so addons can then make use of it.
+
+For working examples, you can check these addons:
+- [IMDB Lists](https://github.com/jaruba/stremio-imdb-list)
+- [IMDB Watchlist](https://github.com/jaruba/stremio-imdb-watchlist)
+- [Jackett Addon for Stremio](https://github.com/BoredLama/stremio-jackett-addon) (community built)
+
+Another use case for passing user data through the Addon Repository URL is creating proxy addons. This case presumes that the id of a different addon is sent in the Addon Repository URL, then the proxy addon connects to the addon of which the id it got, requests streams, passes the stream url to some API (for example Real Debrid, Premiumize, etc) to get a different streaming url that it then responds with for Stremio.
+
+
+## Creating Addon Configuration Pages
+
+This guide extends [Using User Data in Addons](#using-user-data-in-addons) by explaining how to create an Addon Configuration Page.
+
+In order to allow Addons to request user data, you will first need to create a web page on the `/configure` path of your addon and set `manifest.behaviorHints.configurable` to `true`. (you can also set `manifest.behaviorHints.configurationRequired` to `true` if your addon cannot be installed without user data)
+
+The `/configure` web page should include a form with all required data, the form data should be set within the Addon Repository URL (as explained in the [Using User Data in Addons](#using-user-data-in-addons)) section.
+
+An "Install Addon" button should be available on the page that will use the `stremio://` protocol, for example, if your Addon Repository URL is `https://my.addon.com/some-user-data/manifest.json`, the "Install Addon" button should point to `stremio://my.addon.com/some-user-data/manifest.json`. (the `stremio://` protocol links will open or focus the Stremio app with a prompt to install the addon)
+
+
+## Using Deep Links in Addons
+
+Stremio supports [deep links](./deep-links.md), such links can also be used in addons to link internally to Stremio.
+
+First, set the `stream` resource in your [manifest](./api/responses/manifest.md):
+- `resources: ["stream"]`
+
+Here's an example:
+
+```javascript
+// this responds with one stream for the Big Buck Bunny
+// movie, that if clicked, will redirect Stremio to the
+// Board page
+builder.defineStreamHandler(function(args) {
+  return new Promise(function(resolve, reject) {
+    if (args.type === 'movie' && args.id === 'tt1254207') {
+      // serve one stream for big buck bunny
+      const stream = { externalUrl: 'stremio:///board' }
+      resolve({ streams: [stream] })
+    } else {
+      reject(new Error('No streams found for: ' + args.id))
+    }
+  })
+})
+```
+
+
+## Proxying Other Addons
+
+Stremio addons use a HTTP server to handle requests and responses, this means that other addons can also request their responses.
+
+This can be useful for many reasons, a guide on how this can be done is included in the readme of the [IMDB Watchlist](https://github.com/jaruba/stremio-imdb-watchlist) Addon which proxies the [IMDB Lists](https://github.com/jaruba/stremio-imdb-list) addon to get the IMDB List for a particular IMDB user.
+
+IMDB Watchlist only proxies the catalog from IMDB Lists, to proxy other resources you can use the same pattern as IMDB Watchlist does, and check the endpoints and patterns for other resources on the [Protocol Documentation](./protocol.md) page.
+
+
+
+## Crawler / Scraping Addons
+
+Scraping HTML pages presumes downloading the HTML source of a web page in order to get specific data from it.
+
+A guide showing a simplistic version of doing this is in the readme of the [IMDB Watchlist Addon](https://github.com/jaruba/stremio-imdb-watchlist). The addon uses [needle](https://www.npmjs.com/package/needle) to request the HTML source and [cheerio](https://www.npmjs.com/package/cheerio) to start a jQuery instance in order to simplify getting the desired information.
+
+Cheerio is not the only module that can help with crawling / scraping though, other modules that can aid in this: [jsdom](https://www.npmjs.com/package/jsdom), [xpath](https://www.npmjs.com/package/xpath), etc
+
+
+
+---
+File: /docs/deep-links.md
+---
+
+# Stremio - Deep links
+
+Stremio supports two types of deep links through the `stremio://` protocol
+
+**NOTE:** GitHub does not allow links with a custom protocol, so just copy-paste the examples links in your browser's address bar and press Enter.
+
+**Support for intents varies depending on platform.**
+
+## To addons
+
+Simply take a normal URL to a Stremio addon manifest, e.g. `https://watchhub-us.strem.io/manifest.json`, and replace the leading `https://` with `stremio://`
+
+E.g. [stremio://watchhub-us.strem.io/manifest.json](stremio://watchhub-us.strem.io/manifest.json)
+
+
+## To a page
+
+
+### Board
+
+[stremio:///board](stremio:///board)
+
+
+### Discover
+
+[stremio:///discover](stremio:///discover)
+
+`stremio:///discover/{catalogAddonUrl}/{type}/{id}?genre={genre}`
+
+* `catalogAddonUrl` - URL to manifest of the addon (URI encoded)
+* `type` the addon type, see [content types](./api/responses/content.types.md)
+* `id` [catalog id](./api/responses/manifest.md#catalog-format) from the addon
+* `genre` the filter genre, see [catalog extra properties](./api/responses/manifest.md#extra-properties)
+
+
+## Library
+
+[stremio:///library](stremio:///library)
+
+
+## Search
+
+`stremio:///search?search={query}`
+
+* `query` the search query (URI encoded)
+
+
+### Detail
+
+`stremio:///detail/{type}/{id}/{videoId}?autoPlay={autoPlay}`
+
+* `type` corresponds to [content types](./api/responses/content.types.md)
+
+* `id` is the [meta object ID](./api/responses/meta.md#meta-object)
+
+* `videoID` is the [video object ID](./api/responses/meta.md#video-object); leave this empty if you only wish to show the list of episodes/videos (not applicable for one-video types, such as `movie` and `tv`)
+
+* `autoPlay` can be `true` or `false`, optional, attempt playing the video with `videoID`, success depends on if the user played that video or a video from that meta before (in which case a stream url for the video, or a stream [bingeGroup](./api/responses/stream.md#additional-properties-to-provide-information--behaviour-flags) may be already available), currently only supported in the Android TV app
+
+In the Cinemeta addon, the `videoID` is the same as the `id` for movies, and for series it's formed as `{id}:{season}:episode`
+
+In the Channels addon, the `videoID` is formed as `{id}:{youtube video ID}`
+
+Examples:
+
+[stremio:///detail/movie/tt0066921/tt0066921](stremio:///detail/movie/tt0066921/tt0066921)
+
+[stremio:///detail/series/tt0108778/tt0108778:1:1](stremio:///detail/series/tt0108778:1:1)
+
+[stremio:///detail/channel/yt_id:UCrDkAvwZum-UTjHmzDI2iIw](stremio:///detail/channel/yt_id:UCrDkAvwZum-UTjHmzDI2iIw)
+
+
+
+
+---
+File: /docs/examples.md
+---
+
+# Stremio Addon Examples
+
+
+### Examples using SDK
+
+- [Hello World Addon](https://github.com/Stremio/addon-helloworld): also includes a step by step tutorial
+- [IGDB Addon](https://github.com/Stremio/stremio-igdb-addon/tree/tutorial)
+
+### Examples not using this SDK
+
+- [PHP Addon Example & Tutorial](https://github.com/Stremio/stremio-php-addon-example)
+- [Laravel (PHP) Addon Template](https://github.com/rleroi/Stremio-Laravel)
+- [Go Addon Example](https://github.com/Stremio/addon-helloworld-go)
+- [Go Addon Examples Using Unofficial SDK](https://github.com/Deflix-tv/go-stremio/tree/master/examples)
+- [Python Addon Example & Tutorial](https://github.com/Stremio/addon-helloworld-python)
+- [Ruby Addon Example & Tutorial](https://github.com/Stremio/addon-helloworld-ruby)
+- [C# Addon Example](https://github.com/Stremio/addon-helloworld-csharp)
+- [Rust Addon Example Using Unofficial SDK](https://github.com/sleeyax/stremio-addon-sdk/tree/master/example-addon)
+- [Node.js Express Addon Example & Tutorial](https://github.com/Stremio/addon-helloworld-express)
+- [Node.js Express Addon Example Using User Data](./advanced.md)
+- [IMDB Lists - Node.js Express Addon Using User Data and Ajax Calls](https://github.com/jaruba/stremio-imdb-list)
+- [IMDB Watchlist - Node.js Express Addon Using User Data and Proxying Another Stremio Addon](https://github.com/jaruba/stremio-imdb-watchlist)
+- [Jackett Addon - Node.js Express Addon Using User Data](https://github.com/BoredLama/stremio-jackett-addon)
+
+
+### Guides
+
+- [Official SDK guide](https://stremio.github.io/stremio-addon-guide/sdk-guide/prelude)
+- [Official generic guide](https://stremio.github.io/stremio-addon-guide/basics)
+
+
+### Video tutorials
+
+- [Building a Stremio addon](https://www.youtube.com/watch?v=HqTkQeRKF-c&list=PLhslIqdUyoB-8olXVaYQxDLJIIOcSQU3H)
+
+
+
+---
+File: /docs/protocol.md
+---
+
+
+## Stremio Addon Protocol
+
+**If you're creating an addon, we recommend you build it using our [addon-sdk](https://github.com/Stremio/stremio-addon-sdk), which will provide a convenient abstraction to the protocol, as well as an easy way of publishing your addons.**
+
+The Stremio addon protocol defines a universal interface to describe multimedia content. It can describe catalogs, detailed metadata and streams related to multimedia content.
+
+It is typically transported over HTTP or IPFS, and follows a paradigm similar to REST.
+
+This allows Stremio or other similar applications to aggregate content seamlessly from different sources, for example YouTube, Twitch, iTunes, Netflix, DTube and others. It also allows developers to build such addons with minimal skill.
+
+To define a minimal addon, you only need an HTTP server/endpoint serving a `/manifest.json` file and responding to resource requests at `/{resource}/{type}/{id}.json`.
+
+Currently used resources are: `catalog`, `meta`, `stream`, `subtitles`.
+
+`/catalog/{type}/{id}.json` - catalogs of media items; `type` denotes the type, such as `movie`, `series`, `channel`, `tv`, and `id` denotes the catalog ID, which is custom and specified in your manifest, `id` is required as an addon can hold multiple catalogs
+
+`/meta/{type}/{id}.json` - detailed metadata about a particular item; `type` again denotes the type, and `id` is the ID of the particular item, as found in the catalog
+
+`/stream/{type}/{videoID}.json` - list of all streams for a particular item; `type` again denotes the type, and `videoID` is the video ID: a single metadata object may contain mutiple videos, for example a YouTube channel or a TV series; for single-video items (such as movies), the video ID is equal to the item ID
+
+`/subtitles/{type}/{id}.json` - list of all subtitles for a particular item; `type` again denotes the type, the `id` in this case is the Open Subtitles file hash, while `extraArgs` (read below) is used for `videoID` (the ID of the particular item, as found in the catalog or a video ID) and `videoSize` (video file size in bytes)
+
+The JSON format of the response to these resources is described [here](./api/responses/).
+
+To pass extra args, such as the ones needed for `catalog` resources (e.g. `search`, `skip`), you should define a route of the format `/{resource}/{type}/{id}/{extraArgs}.json` where `extraArgs` is the query string stringified object of extra arguments (for example `"search=game%20of%20thrones&skip=100"`)
+
+For the HTTP transport, each route, including `/manifest.json`, must serve CORS headers that allow all origins.
+
+**NOTE: Your addon may selectively provide any number of resources. It must provide at least 1 resource and a manifest.**
+
+## Transports, URLs
+
+The abstractions that are used to actually request data from addons are called "transports".
+
+A client library normally implements the following transports: HTTP, legacy and IPFS. "legacy" is a special type of transport that maps the resource requests (in the form of `{ resource, type, id, extraArgs }`) to requests to the legacy v1/v2 versions of the addon protocol.
+
+"Transport URL" refers to the URL to the addon. Depending on the protocol of the URL and suffix of the pathname, the relevant transport will be selected:
+
+* `https://.../manifest.json`: HTTP transport
+* `https://.../stremio/v1`: legacy transport
+* `ipfs://.../manifest.json` or `ipns://.../manifest.json`: IPFS transport
+
+For more details regarding the concepts used in the client library, go to https://github.com/stremio/stremio-addon-client/
+
+## Minimal example
+
+Create a directory called `example-addon`
+
+
+`manifest.json`:
+
+```
+{
+    "id": "org.myexampleaddon",
+    "version": "1.0.0",
+    "name": "simple Big Buck Bunny example",
+    "types": [ "movie" ],
+    "catalogs": [ { "type": "movie", "id": "bbbcatalog" } ],
+    "resources": [
+        "catalog",
+        {
+            "name": "stream",
+            "types": [ "movie" ],
+            "idPrefixes": [ "tt" ]
+        }
+    ]
+}
+```
+
+[Manifest Object Definition](./api/responses/manifest.md)
+
+In this simple example, we set the id prefix of the streams to `tt`, which is the prefix for IMDB IDs (example: `tt1254207`).
+Because we're using IMDB IDs, we do not need to handle the Meta requests, as all IMDB IDs from all addons are handled
+internally by Stremio's Cinemeta Addon.
+
+
+`/catalog/movie/bbbcatalog.json`:
+
+```
+{
+    "metas": [
+        {
+            "id": "tt1254207",
+            "type": "movie",
+            "name": "Big Buck Bunny",
+            "poster": "https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg"
+        }
+    ]
+}
+```
+
+[Meta Object Definition](./api/responses/meta.md)
+
+
+`/stream/movie/tt1254207.json`:
+
+```
+{
+    "streams": [
+        {
+            "name": "", // name is optional
+            "url": "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4"
+        },
+        // add more streams:
+        {
+            "name": "",
+            "url": ""
+        }
+    ]
+}
+```
+
+[Stream Object Definition](./api/responses/stream.md)
+
+That's it! By handling "catalog" and "stream" with the IMDB ID prefix ("tt"), we have a complete addon serving just one stream
+for Big Buck Bunny that has it's own catalog that has only Big Buck Bunny in it. Also, because this is based on IMDB ID, the
+stream will also be available if users open Big Buck Bunny from other addons that use IMDB IDs too.
+
+
+If we were to also want subtitles for this addon, we could add: `{ "name": "subtitles", "type": "movie", idPrefixes: [ "tt" ] }`
+to the addon manifest's `resources` and then handle subtitle requests with:
+
+`/subtitle/movie/tt1254207.json`:
+
+```
+{
+    "subtitles": [
+        {
+            url: "https://mkvtoolnix.download/samples/vsshort-en.srt",
+            lang: "en"
+        },
+        ...
+    ]
+}
+```
+
+[Subtitle Object Definition](./api/responses/subtitles.md)
+
+
+Alternatively, if we were to not use the IMDB ID prefix ("tt"), and would use a different prefix, such as "exampleid", then "Big Buck
+Bunny" would have a presumable ID of "exampleid1". In this case, we could add `{ "name": "meta", "type": "movie", idPrefixes: [ "exampleid" ]}`
+to the addon manifest's `resources` and then handle meta requests too with:
+
+
+`/meta/movie/exampleid1.json`:
+
+```
+{
+    "meta": [
+        {
+            "id": "exampleid1",
+            "type": "movie",
+            "name": "Big Buck Bunny",
+            "poster": "https://image.tmdb.org/t/p/w600_and_h900_bestv2/uVEFQvFMMsg4e6yb03xOfVsDz4o.jpg"
+        }
+    ]
+}
+```
+
+[Meta Object Definition](./api/responses/meta.md)
+
+Meta requests are done when Stremio opens a Details page for a movie (series, channel, etc.) The response is used to create the Details page, it can also handle "background", "logo", "releaseInfo" and other extended information about the movie / series / etc. As previously mentioned, the meta request does not need to be handled at all when using the IMDB
+ID prefix, as that is handled internally by Stremio.
+
+
+This addon is so simple that it can actually be hosted statically on GitHub pages!
+
+[See Example Static Addon](https://github.com/Stremio/stremio-static-addon-example)
+
+
+## Objects
+
+[Metadata](./api/responses/meta.md)
+
+[Stream](./api/responses/stream.md)
+
+[Subtitles](./api/responses/subtitles.md)
+
+
+## Next steps
+
+Check out the following tutorials for different languages:
+
+**If in doubt, and you know JavaScript, use the Node.js SDK**
+
+* [Creating an addon with the NodeJS Stremio Addon SDK](https://github.com/Stremio/addon-helloworld)
+* [Creating an addon with NodeJS and express](https://github.com/Stremio/addon-helloworld-express)
+* [Creating an addon with PHP](https://github.com/Stremio/stremio-php-addon-example)
+* [Creating an addon with Python](https://github.com/stremio/addon-helloworld-python)
+* [Creating an addon with Ruby](https://github.com/stremio/addon-helloworld-ruby)
+* [Creating an addon with Go](https://github.com/stremio/addon-helloworld-go)
+* [Creating an addon with C#](https://github.com/stremio/addon-helloworld-csharp)
+* [Creating an addon with Java](https://github.com/stremio/addon-helloworld-java)
+
+
+
+---
+File: /docs/README.md
+---
+
+# Getting Started
+
+A NodeJS SDK for making and publishing Stremio addons
+
+## Example
+
+**This arbitrary example creates an addon that provides a stream for Big Buck Bunny and outputs a HTTP address where you can access it**
+
+```javascript
+#!/usr/bin/env node
+
+const { addonBuilder, serveHTTP, publishToCentral } = require('stremio-addon-sdk')
+
+const builder = new addonBuilder({
+    id: 'org.myexampleaddon',
+    version: '1.0.0',
+
+    name: 'simple example',
+
+    // Properties that determine when Stremio picks this addon
+    // this means your addon will be used for streams of the type movie
+    resources: ['stream'],
+    types: ['movie'],
+    idPrefixes: ['tt']
+})
+
+// takes function(args), returns Promise
+builder.defineStreamHandler(function(args) {
+    if (args.type === 'movie' && args.id === 'tt1254207') {
+        // serve one stream to big buck bunny
+        // return addonSDK.Stream({ url: '...' })
+        const stream = { url: 'http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4' }
+        return Promise.resolve({ streams: [stream] })
+    } else {
+        // otherwise return no streams
+	return Promise.resolve({ streams: [] })
+    }
+})
+
+serveHTTP(builder.getInterface(), { port: 7000 })
+
+// If you want this addon to appear in the addon catalogs, call .publishToCentral() with the publically available URL to your manifest
+//publishToCentral('https://my-addon.com/manifest.json')
+
+```
+
+Save this as `addon.js` and run:
+
+```bash
+npm install stremio-addon-sdk
+node ./addon.js
+```
+
+It will output a URL that you can use to [install the addon in Stremio](./docs/testing.md#how-to-install-add-on-in-stremio)
+
+## Documentation
+
+**To get familiar with the resources and their roles, [read this](./api/README.md).**
+
+#### `const { addonBuilder, serveHTTP, getRouter, publishToCentral } = require('stremio-addon-sdk')`
+
+Imports everything the SDK provides:
+
+* `addonBuilder`, which you'll need to define the addon
+* `serveHTTP`, which you will need to serve a HTTP server for this addon
+* `getRouter`, converts an `addonInterface` to an express router
+* `publishToCentral`: publishes an addon URL to the public addon catalog
+
+
+#### `const builder = new addonBuilder(manifest)`
+
+Creates an addon builder object with a given manifest. This will throw if the manifest is not valid.
+
+The manifest will determine the basic information of your addon (name, description, images), but most importantly, it will determine **when and how** your addon will be invoked by Stremio.
+
+[Manifest Object Definition](./api/responses/manifest.md)
+
+
+#### `builder.defineCatalogHandler(function handler(args) { })`
+
+Handles catalog requests, including search.
+
+[Catalog Request Parameters and Example](./api/requests/defineCatalogHandler.md)
+
+
+#### `builder.defineMetaHandler(function handler(args) { })`
+
+Handles metadata requests. (title, releaseInfo, poster, background, etc.)
+
+[Meta Request Parameters and Example](./api/requests/defineMetaHandler.md)
+
+
+#### `builder.defineStreamHandler(function handler(args) { })`
+
+Handles stream requests.
+
+[Stream Request Parameters and Example](./api/requests/defineStreamHandler.md)
+
+
+#### `builder.defineSubtitlesHandler(function handler(args) { })`
+
+Handles subtitle requests.
+
+[Subtitle Request Parameters and Example](./api/requests/defineSubtitlesHandler.md)
+
+
+#### `builder.defineResourceHandler('addon_catalog', function handler(args) { })`
+
+Handles addon catalog requests, this can be used by an addon to just send a list of other addon manifests.
+
+[Addon Catalog Request Parameters and Example](./api/requests/defineResourceHandler.md)
+
+**The JSON format of the response to these resources is described [here](./api/responses).**
+
+
+#### `builder.getInterface()`: returns an `addonInterface`
+
+Turns the `addon` into an `addonInterface`, which is an immutable (frozen) object that has `{manifest, get}`; manifest is a regular [manifest object](./api/responses/manifest.md), while `get` is a function that takes one argument of the form `{ resource, type, id, extra }`, and returns a `Promise`
+
+
+#### `getRouter(addonInterface)`
+
+Turns the `addonInterface` into an express router, that serves the addon according to [the protocol](./protocol.md), and a landing page on the root (`/`)
+
+
+#### `publishToCentral(url)`
+
+This method expects a string with the url to your `manifest.json` file.
+
+Publish your addon to the central server. After using this method your addon will be available in the Community Addons list in Stremio for users to install and use. Your addon needs to be publicly available with a URL in order for this to happen, as local addons that are not publicly available cannot be used by other Stremio users.
+
+
+#### `serveHTTP(addonInterface, options)`
+
+Starts the addon server. `options` is an object that contains:
+
+* `port`
+* `cacheMaxAge` (in seconds); `cacheMaxAge` means the `Cache-Control` header being set to `max-age=$cacheMaxAge`
+* `static`: path to a directory of static files to be served; e.g. `/public` 
+
+This method is also special in that it will react to certain process arguments, such as:
+
+* `--launch`: launches Stremio in the web browser, and automatically installs/upgrades the addon
+* `--install`: installs the addon in the desktop version of Stremio
+
+
+#### `addonInterface`
+
+The `addonInterface`, as returned from `builder.getInterface()`, has two properties:
+
+* `get({ resource, type, id, extra })` - returns a Promise
+* `manifest`: [manifest object](./api/responses/manifest.md)
+
+
+
+---
+File: /docs/testing.md
+---
+
+## Testing your Addon
+
+To test your addon, you will need to add the addon manifest URL to a client.
+
+There are currently two such clients that you can test with:
+
+- Stremio v4.4.10+
+
+- Stremio Web Version
+
+**Note:** if you want to load an addon by URL in Stremio, the URL must either be accessed on `127.0.0.1` or support HTTPS.
+
+
+### Starting/launching shortcuts
+
+If you're using the [`serveHTTP`](/docs/README.md#servehttpaddoninterface-options) method, there are two shortcuts that you can use:
+
+If you launch your addon with `npm start -- --launch`, it will open a web version of Stremio with the addon pre-installed.
+
+Another shortcut is to use `npm start -- --install`, which will open the desktop version of Stremio and a prompt to install the addon.
+
+
+### Testing in Stremio App
+
+Testing in Stremio is easy, simply [download Stremio](https://www.stremio.com/downloads) v4.4.10+ (latest beta from the site)
+
+
+### Testing in Stremio Web Version
+
+Open the web version of Stremio at: https://app.strem.io/shell-v4.4/
+
+If you use `npm start -- --launch`, the addon will launch at https://staging.strem.io, which is a staging (development) version of Stremio.
+
+**Note: Torrents will not work in Stremio's Web Version.**
+
+
+### How to Install Addon in Stremio
+
+Follow the 2 steps showcased in this image:
+
+![add-on-repository-url](https://user-images.githubusercontent.com/1777923/43146711-65a33ccc-8f6a-11e8-978e-4c69640e63e3.png)
+
+
+
+---
+File: /examples/from-readme.js
+---
+
+#!/usr/bin/env node
+const { addonBuilder, serveHTTP } = require('../')
+
+const builder = new addonBuilder({
+	id: 'org.myexampleaddon',
+	version: '1.0.0',
+
+	name: 'simple example',
+
+	// Properties that determine when Stremio picks this addon
+	// this means your addon will be used for streams of the type movie
+	catalogs: [],
+	resources: ['stream'],
+	types: ['movie'],
+})
+
+// takes function(type, id, cb)
+builder.defineStreamHandler(function(args) {
+	if (args.type === 'movie' && args.id === 'tt1254207') {
+		// serve one stream to big buck bunny
+		const stream = { url: 'http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4' }
+		return Promise.resolve({ streams: [stream] })
+	} else {
+		// otherwise return no streams
+		return Promise.resolve({ streams: [] })
+	}
+})
+
+serveHTTP(builder.getInterface(), { port: process.env.PORT || 43001 })
+
+
+
+---
+File: /src/builder.js
+---
+
+const linter = require('stremio-addon-linter')
+
+// Implements a builder pattern, but we can built into a router or an interface
+// the addonInterface is just an object: { manifest, get(resource, type, id, extra) }
+function AddonBuilder(manifest) {
+	const handlers = {}
+
+	// Lint the manifest
+	const linterRes = linter.lintManifest(manifest)
+	if (!linterRes.valid) {
+		//console.error('Manifest issues:\n' + linterRes.errors.join('\n'))
+		throw linterRes.errors[0]
+	}
+	if (linterRes.warnings.length) {
+		linterRes.warnings.forEach(function(warning) {
+			console.log('WARNING:', warning.message)
+		})
+	}
+	Object.freeze(manifest)
+
+	// Check the manifest length
+	if (JSON.stringify(manifest).length > 8192) {
+		throw new Error('manifest size exceeds 8kb, which is incompatible with addonCollection API')
+	}
+
+	// Validation: called on building
+	const validate = function() {
+		const errors = []
+		const handlersInManifest = []
+		if (manifest.catalogs.length > 0) handlersInManifest.push('catalog')
+		manifest.resources.forEach((r) => handlersInManifest.push(r.name || r))
+		const handlersDefined = Object.keys(handlers)
+		handlersDefined.forEach(defined => {
+			if (!handlersInManifest.includes(defined)) {
+				if (defined == 'catalog') errors.push(new Error('manifest.catalogs is empty, catalog handler will never be called'))
+				else errors.push(new Error('manifest.resources does not contain: '+defined))
+			}
+		})
+		handlersInManifest.forEach(defined => {
+			if (!handlersDefined.includes(defined)) {
+				const capitalized = defined[0].toUpperCase() + defined.slice(1)
+				errors.push(new Error(
+					`manifest definition requires handler for ${defined},`
+					+` but it is not provided (use .define${capitalized}Handler())`
+				))
+			}
+		})
+		return errors
+	}
+	const validOrExit = function() {
+		const errors = validate()
+		if (errors.length) {
+			//errors.forEach(e => console.error(`ERROR: ${e.message}`))
+			throw errors[0]
+		}
+	}
+
+	// Public interface
+	this.defineResourceHandler = function(resource, handler) {
+		if (handlers[resource]) {
+			throw new Error('handler for '+resource+' already defined')
+		}
+		handlers[resource] = handler
+		return this
+	}
+	this.defineStreamHandler = this.defineResourceHandler.bind(this, 'stream')
+	this.defineMetaHandler = this.defineResourceHandler.bind(this, 'meta')
+	this.defineCatalogHandler = this.defineResourceHandler.bind(this, 'catalog')
+	this.defineSubtitlesHandler = this.defineResourceHandler.bind(this, 'subtitles')
+
+	// build into an interface
+	this.getInterface = function() {
+		validOrExit()
+		return new AddonInterface(manifest, handlers)
+	}
+
+	return this
+}
+
+function AddonInterface(manifest, handlers) {
+	this.manifest = Object.freeze(Object.assign({}, manifest))
+	this.get = (resource, type, id, extra = {}, config = {}) => {
+		const handler = handlers[resource]
+		if (!handler) {
+			return Promise.reject({
+				message: `No handler for ${resource}`,
+				noHandler: true
+			})
+		}
+		return handler({ type, id, extra, config })
+	}
+	return this
+}
+
+module.exports = AddonBuilder
+
+
+
+---
+File: /src/getRouter.js
+---
+
+const Router = require('router')
+const qs = require('querystring')
+const cors = require('cors')
+
+const warned = {}
+
+function getRouter({ manifest , get }) {
+	const router = new Router()
+
+	// CORS is mandatory for the addon protocol
+	router.use(cors())
+
+	// Serve the manifest
+	const manifestBuf = JSON.stringify(manifest)
+	function manifestHandler(req, res) {
+		const { config } = req.params
+		let manifestRespBuf = manifestBuf
+		if (config && manifest.behaviorHints && (manifest.behaviorHints.configurationRequired || manifest.behaviorHints.configurable)) {
+			const manifestClone = JSON.parse(manifestBuf)
+			// we remove configurationRequired so the addon is installable after configuration
+			delete manifestClone.behaviorHints.configurationRequired
+			// we remove configuration page for installed addon too (could be added later to the router)
+			delete manifestClone.behaviorHints.configurable			
+			manifestRespBuf = JSON.stringify(manifestClone)
+		}
+		res.setHeader('Content-Type', 'application/json; charset=utf-8')
+		res.end(manifestRespBuf)
+	}
+
+	const hasConfig = (manifest.config || []).length
+
+	if (hasConfig && !(manifest.behaviorHints || {}).configurable) {
+		console.warn('manifest.config is set but manifest.behaviorHints.configurable is disabled, the "Configure" button will not show in the Stremio apps')
+	}
+
+	const configPrefix = hasConfig ? '/:config?' : ''
+	// having config prifix always set to '/:config?' won't resault in a problem for non configurable addons,
+	// since now the order is restricted by resources.
+
+	router.get(`${configPrefix}/manifest.json`, manifestHandler)
+
+	// using the same methode used in builder.js to extract resources from manifest
+	const handlersInManifest = []
+	if (manifest.catalogs.length > 0) handlersInManifest.push('catalog')
+	manifest.resources.forEach((r) => handlersInManifest.push(r.name || r))
+	
+	// converting the resources array to a regular expression
+	const ResourcesRegex = handlersInManifest && handlersInManifest.length ? '(' + handlersInManifest.join('|') + ')' : '' 
+
+	// Handle all resources
+	router.get(`${configPrefix}/:resource${ResourcesRegex}/:type/:id/:extra?.json`, function(req, res, next) {
+		const { resource, type, id } = req.params
+		let { config } = req.params
+		// we get `extra` from `req.url` because `req.params.extra` decodes the characters
+		// and breaks dividing querystring parameters with `&`, in case `&` is one of the
+		// encoded characters of a parameter value
+		const extra = req.params.extra ? qs.parse(req.url.split('/').pop().slice(0, -5)) : {}
+		if ((config || '').length) {
+			try {
+				config = JSON.parse(config)
+			} catch(e) {
+				config = false
+			}
+		}
+		res.setHeader('Content-Type', 'application/json; charset=utf-8')
+		get(resource, type, id, extra, config)
+			.then(resp => {
+
+				let cacheHeaders = {
+					cacheMaxAge: 'max-age',
+					staleRevalidate: 'stale-while-revalidate',
+					staleError: 'stale-if-error'
+				}
+
+				const cacheControl = Object.keys(cacheHeaders).map(prop => {
+					const cacheProp = cacheHeaders[prop]
+					const cacheValue = resp[prop]
+					if (!Number.isInteger(cacheValue)) return false
+					if (cacheValue > 365 * 24 * 60 * 60)
+						console.warn(`${prop} set to more then 1 year, be advised that cache times are in seconds, not milliseconds.`)
+					return cacheProp + '=' + cacheValue
+				}).filter(val => !!val).join(', ')
+
+				if (cacheControl)
+					res.setHeader('Cache-Control', `${cacheControl}, public`)
+
+				if (resp.redirect) {
+					res.redirect(307, resp.redirect)
+					return
+				}
+
+				res.setHeader('Content-Type', 'application/json; charset=utf-8')
+
+				if (!warned.filename && resource === 'stream' && ((resp || {}).streams || []).length)
+					if (resp.streams.find(stream => stream && stream.url && !(stream.behaviorHints || {}).filename)) {
+						warned.filename = true
+						console.warn('streams include stream.url but do not include stream.behaviorHints.filename, this is not recommended, subtitles may not be retrieved for these streams')
+					}
+
+				res.end(JSON.stringify(resp))
+			})
+			.catch(err => {
+				if (err.noHandler) {
+					if (next) next()
+					else {
+						res.writeHead(404)
+						res.end(JSON.stringify({ err: 'not found' }))
+					}
+				} else {
+					console.error(err)
+					res.writeHead(500)
+					res.end(JSON.stringify({ err: 'handler error' }))
+				}
+			})
+	})
+
+	return router
+}
+
+module.exports = getRouter
+
+
+
+---
+File: /src/index.js
+---
+
+module.exports = {
+	addonBuilder: require('./builder'),
+	serveHTTP: require('./serveHTTP'),
+	getRouter: require('./getRouter'),
+	publishToCentral: require('./publishToCentral'),
+}
+
+
+
+---
+File: /src/landingTemplate.js
+---
+
+const STYLESHEET = `
+* {
+	box-sizing: border-box;
+}
+
+body,
+html {
+	margin: 0;
+	padding: 0;
+	width: 100%;
+	min-height: 100%;
+}
+
+body {
+	padding: 2vh;
+	font-size: 2.2vh;
+}
+
+html {
+	background-size: auto 100%;
+	background-size: cover;
+	background-position: center center;
+	background-repeat: no-repeat;
+	box-shadow: inset 0 0 0 2000px rgb(0 0 0 / 60%);
+}
+
+body {
+	display: flex;
+	font-family: 'Open Sans', Arial, sans-serif;
+	color: white;
+}
+
+h1 {
+	font-size: 4.5vh;
+	font-weight: 700;
+}
+
+h2 {
+	font-size: 2.2vh;
+	font-weight: normal;
+	font-style: italic;
+	opacity: 0.8;
+}
+
+h3 {
+	font-size: 2.2vh;
+}
+
+h1,
+h2,
+h3,
+p {
+	margin: 0;
+	text-shadow: 0 0 1vh rgba(0, 0, 0, 0.15);
+}
+
+p {
+	font-size: 1.75vh;
+}
+
+ul {
+	font-size: 1.75vh;
+	margin: 0;
+	margin-top: 1vh;
+	padding-left: 3vh;
+}
+
+a {
+	color: white
+}
+
+a.install-link {
+	text-decoration: none
+}
+
+button {
+	border: 0;
+	outline: 0;
+	color: white;
+	background: #8A5AAB;
+	padding: 1.2vh 3.5vh;
+	margin: auto;
+	text-align: center;
+	font-family: 'Open Sans', Arial, sans-serif;
+	font-size: 2.2vh;
+	font-weight: 600;
+	cursor: pointer;
+	display: block;
+	box-shadow: 0 0.5vh 1vh rgba(0, 0, 0, 0.2);
+	transition: box-shadow 0.1s ease-in-out;
+}
+
+button:hover {
+	box-shadow: none;
+}
+
+button:active {
+	box-shadow: 0 0 0 0.5vh white inset;
+}
+
+#addon {
+	width: 40vh;
+	margin: auto;
+}
+
+.logo {
+	height: 14vh;
+	width: 14vh;
+	margin: auto;
+	margin-bottom: 3vh;
+}
+
+.logo img {
+	width: 100%;
+}
+
+.name, .version {
+	display: inline-block;
+	vertical-align: top;
+}
+
+.name {
+	line-height: 5vh;
+	margin: 0;
+}
+
+.version {
+	position: relative;
+	line-height: 5vh;
+	opacity: 0.8;
+	margin-bottom: 2vh;
+}
+
+.contact {
+	position: absolute;
+	left: 0;
+	bottom: 4vh;
+	width: 100%;
+	text-align: center;
+}
+
+.contact a {
+	font-size: 1.4vh;
+	font-style: italic;
+}
+
+.separator {
+	margin-bottom: 4vh;
+}
+
+.form-element {
+	margin-bottom: 2vh;
+}
+
+.label-to-top {
+	margin-bottom: 2vh;
+}
+
+.label-to-right {
+	margin-left: 1vh !important;
+}
+
+.full-width {
+	width: 100%;
+}
+`
+
+function landingTemplate(manifest) {
+	const background = manifest.background || 'https://dl.strem.io/addon-background.jpg'
+	const logo = manifest.logo || 'https://dl.strem.io/addon-logo.png'
+	const contactHTML = manifest.contactEmail ?
+		`<div class="contact">
+			<p>Contact ${manifest.name} creator:</p>
+			<a href="mailto:${manifest.contactEmail}">${manifest.contactEmail}</a>
+		</div>` : ''
+
+	const stylizedTypes = manifest.types
+		.map(t => t[0].toUpperCase() + t.slice(1) + (t !== 'series' ? 's' : ''))
+
+	let formHTML = ''
+	let script = ''
+
+	if ((manifest.config || []).length) {
+		let options = ''
+		manifest.config.forEach(elem => {
+			const key = elem.key
+			if (['text', 'number', 'password'].includes(elem.type)) {
+				const isRequired = elem.required ? ' required' : ''
+				const defaultHTML = elem.default ? ` value="${elem.default}"` : ''
+				const inputType = elem.type
+				options += `
+				<div class="form-element">
+					<div class="label-to-top">${elem.title}</div>
+					<input type="${inputType}" id="${key}" name="${key}" class="full-width"${defaultHTML}${isRequired}/>
+				</div>
+				`
+			} else if (elem.type === 'checkbox') {
+				const isChecked = elem.default === 'checked' ? ' checked' : ''
+				options += `
+				<div class="form-element">
+					<label for="${key}">
+						<input type="checkbox" id="${key}" name="${key}"${isChecked}> <span class="label-to-right">${elem.title}</span>
+					</label>
+				</div>
+				`
+			} else if (elem.type === 'select') {
+				const defaultValue = elem.default || (elem.options || [])[0]
+				options += `<div class="form-element">
+				<div class="label-to-top">${elem.title}</div>
+				<select id="${key}" name="${key}" class="full-width">
+				`
+				const selections = elem.options || []
+				selections.forEach(el => {
+					const isSelected = el === defaultValue ? ' selected' : ''
+					options += `<option value="${el}"${isSelected}>${el}</option>`
+				})
+				options += `</select>
+               </div>
+               `
+			}
+		})
+		if (options.length) {
+			formHTML = `
+			<form class="pure-form" id="mainForm">
+				${options}
+			</form>
+
+			<div class="separator"></div>
+			`
+			script += `
+			installLink.onclick = () => {
+				return mainForm.reportValidity()
+			}
+			const updateLink = () => {
+				const config = Object.fromEntries(new FormData(mainForm))
+				installLink.href = 'stremio://' + window.location.host + '/' + encodeURIComponent(JSON.stringify(config)) + '/manifest.json'
+			}
+			mainForm.onchange = updateLink
+			`
+		}
+	}
+
+	return `
+	<!DOCTYPE html>
+	<html style="background-image: url(${background});">
+
+	<head>
+		<meta charset="utf-8">
+		<title>${manifest.name} - Stremio Addon</title>
+		<style>${STYLESHEET}</style>
+		<link rel="shortcut icon" href="${logo}" type="image/x-icon">
+		<link href="https://fonts.googleapis.com/css?family=Open+Sans:400,600,700&display=swap" rel="stylesheet">
+		<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/purecss@2.1.0/build/pure-min.css" integrity="sha384-yHIFVG6ClnONEA5yB5DJXfW2/KC173DIQrYoZMEtBvGzmf0PKiGyNEqe9N6BNDBH" crossorigin="anonymous">
+	</head>
+
+	<body>
+		<div id="addon">
+			<div class="logo">
+			<img src="${logo}">
+			</div>
+			<h1 class="name">${manifest.name}</h1>
+			<h2 class="version">v${manifest.version || '0.0.0'}</h2>
+			<h2 class="description">${manifest.description || ''}</h2>
+
+			<div class="separator"></div>
+
+			<h3 class="gives">This addon has more :</h3>
+			<ul>
+			${stylizedTypes.map(t => `<li>${t}</li>`).join('')}
+			</ul>
+
+			<div class="separator"></div>
+
+			${formHTML}
+
+			<a id="installLink" class="install-link" href="#">
+			<button name="Install">INSTALL</button>
+			</a>
+			${contactHTML}
+		</div>
+		<script>
+			${script}
+
+			if (typeof updateLink === 'function')
+			updateLink()
+			else
+			installLink.href = 'stremio://' + window.location.host + '/manifest.json'
+		</script>
+	</body>
+
+	</html>`
+}
+
+module.exports = landingTemplate
+
+
+
+---
+File: /src/publishToCentral.js
+---
+
+const fetch = require('node-fetch')
+
+const DEFAULT_API_URL = 'https://api.strem.io'
+
+module.exports = function publishToCentral(addonURL, apiURL) {
+	apiURL = apiURL || DEFAULT_API_URL
+
+	return fetch(apiURL+'/api/addonPublish', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ transportUrl: addonURL, transportName: 'http' })
+	})
+		.then(function(res) { return res.json() })
+		.then(function(resp) {
+			if (resp.error) throw resp.error
+			return resp.result
+		})
+}
+
+
+---
+File: /src/serveHTTP.js
+---
+
+const express = require('express')
+const fs = require('fs')
+const path = require('path')
+const landingTemplate = require('./landingTemplate')
+const getRouter = require('./getRouter')
+const opn = require('opn')
+
+function serveHTTP(addonInterface, opts = {}) {
+	if (addonInterface.constructor.name !== 'AddonInterface') {
+		throw new Error('first argument must be an instance of AddonInterface')
+	}
+
+	const cacheMaxAge = opts.cacheMaxAge || opts.cache
+
+	if (cacheMaxAge > 365 * 24 * 60 * 60)
+		console.warn('cacheMaxAge set to more then 1 year, be advised that cache times are in seconds, not milliseconds.')
+
+	const app = express()
+	app.use((_, res, next) => {
+		if (cacheMaxAge && !res.getHeader('Cache-Control'))
+			res.setHeader('Cache-Control', 'max-age='+cacheMaxAge+', public')
+		next()
+	})
+	app.use(getRouter(addonInterface))
+
+	// serve static dir
+	if (opts.static) {
+		const location = path.join(process.cwd(), opts.static)
+		if (!fs.existsSync(location)) throw new Error('directory to serve does not exist')
+		app.use(opts.static, express.static(location))
+	}
+
+	const hasConfig = !!(addonInterface.manifest.config || []).length
+
+	// landing page
+	const landingHTML = landingTemplate(addonInterface.manifest)
+	app.get('/', (_, res) => {
+		if (hasConfig) {
+			res.redirect('/configure')
+		} else {
+			res.setHeader('content-type', 'text/html')
+			res.end(landingHTML)
+		}
+	})
+
+	if (hasConfig)
+		app.get('/configure', (_, res) => {
+			res.setHeader('content-type', 'text/html')
+			res.end(landingHTML)
+		})
+
+	const server = app.listen(opts.port)
+	return new Promise(function(resolve, reject) {
+		server.on('listening', function() {
+			const url = `http://127.0.0.1:${server.address().port}/manifest.json`
+			console.log('HTTP addon accessible at:', url)
+			if (process.argv.includes('--launch')) {
+				const base = 'https://staging.strem.io#'
+				//const base = 'https://app.strem.io/shell-v4.4#'
+				const installUrl = `${base}?addonOpen=${encodeURIComponent(url)}`
+				opn(installUrl)
+			}
+			if (process.argv.includes('--install')) {
+				opn(url.replace('http://', 'stremio://'))
+			}
+			resolve({ url, server })
+		})
+		server.on('error', reject)
+	})
+}
+
+module.exports = serveHTTP
+
+
+
+---
+File: /test/basic.js
+---
+
+#!/usr/bin/env node
+
+const tape = require('tape')
+const request = require('supertest')
+const AddonClient = require('stremio-addon-client')
+const { addonBuilder, serveHTTP, getRouter, publishToCentral } = require('../')
+
+const PORT = 5000
+
+let addonUrl
+let addonServer
+
+const manifest = {
+	id: 'org.myexampleaddon',
+	version: '1.0.0',
+	description: 'not so simple',
+
+	name: 'simple example',
+
+	logo: `http://localhost:${PORT}/static/imgs/logo.png`,
+	background: `http://localhost:${PORT}/static/imgs/background.jpg`,
+
+	resources: ['stream'],
+	types: ['movie'],
+
+	catalogs: [{ type: 'movie', id: 'test' }],
+}
+
+tape('try to create an addon with an invalid manifest', function(t) {
+	try { new addonBuilder(null) }
+	catch(e) {
+		t.ok(e.message, 'invalid manifest')
+		t.end()
+	}
+})
+
+tape('try to create an addon with an invalid manifest: linter', function(t) {
+	try { new addonBuilder({ name: 'something' }) }
+	catch(e) {
+		t.equal(e.message, 'manifest.id must be a string')
+		t.end()
+	}
+})
+
+tape('try to create an addon with an unspecified resource', function(t) {
+	try { new addonBuilder(manifest).defineMetaHandler(function() { }).getInterface() }
+	catch(e) {
+		t.equal(e.message, 'manifest.resources does not contain: meta')
+		t.end()
+	}
+})
+
+
+tape('create an addon and get the router', function(t) {
+	// getRouter requires all handlers to be defined
+	var addon = new addonBuilder(manifest)
+		.defineCatalogHandler(() => Promise.resolve())
+		.defineStreamHandler(() => Promise.resolve())
+	t.ok(getRouter(addon.getInterface()), 'can get router')
+	t.end()
+})
+
+tape('create an addon and expose on HTTP with serveHTTP()', function(t) {
+	const builder = new addonBuilder(manifest)
+		.defineCatalogHandler(() => Promise.resolve({ metas: [] }))
+		// NOTE: we're not supposed to mirror back the `args`, but we're doing it for easier testing
+		.defineStreamHandler((args) => Promise.resolve({ streams: [], args }))
+
+	serveHTTP(builder.getInterface(), { port: PORT, cacheMaxAge: 3600 }).then(function(h) {
+		t.ok(h.url, 'has url')
+		t.ok(h.url.endsWith('manifest.json'), 'url ends with manifest.json')
+
+		t.ok(h.server, 'has h.server')
+
+		addonUrl = h.url
+		addonServer = h.server
+
+		request(addonServer)
+			.get('/manifest.json')
+			.expect(200)
+			.end((err, res) => {
+				t.error(err, 'request error')
+				t.error(res.error, 'response error')
+				t.equal(res.ok, true, 'has response status 200')
+				t.equal(res.status, 200, 'has response status ok')
+				t.equal(res.headers['cache-control'], 'max-age=3600, public', 'cache headers are correct')
+				t.end()
+			})
+
+	})
+})
+
+tape('try to serve a directory that does not exist', function (t) {
+	var addon = new addonBuilder(manifest)
+		.defineCatalogHandler(() => Promise.resolve())
+		.defineStreamHandler(() => Promise.resolve())
+	try {
+		serveHTTP(addon.getInterface(), { static: '/notexist' })
+	} catch (e) {
+		t.equal(e.message, 'directory to serve does not exist')
+		t.end()
+	}
+})
+
+tape('try to serve a directory', function (t) {
+	var addon = new addonBuilder(manifest)
+		.defineCatalogHandler(() => Promise.resolve())
+		.defineStreamHandler(() => Promise.resolve())
+
+	serveHTTP(addon.getInterface(), { static: '/docs' }).then(function (h) {
+		request(h.server)
+			.get('/docs/README.md')
+			.expect(200)
+			.end((err, res) => {
+				h.server.close()
+				t.error(err, 'request error')
+				t.error(res.error, 'response error')
+				t.equal(res.ok, true, 'has response status 200')
+				t.equal(res.status, 200, 'has response status ok')
+				t.equal(res.type, 'text/markdown', 'is a valid markdown document')
+				t.end()
+			})
+	})
+})
+
+// Test the homepage of the addon
+tape('should return a valid html document', function (t) {
+	request(addonServer)
+		.get('/')
+		.expect(200)
+		.end((err, res) => {
+			t.error(err, 'request error')
+			t.error(res.error, 'response error')
+			t.equal(res.ok, true, 'has response status ok')
+			t.equal(res.status, 200, 'has response status 200')
+			t.notEqual(res.text, undefined, 'is not undefined')
+			t.equal(res.type, 'text/html', 'is a valid html document')
+			t.end()
+		})
+})
+
+
+tape('initialize an addon client for the addon', function(t) {
+	AddonClient.detectFromURL(addonUrl)
+		.then(function(resp) {
+			t.ok(resp.addon, 'has addon')
+
+			t.ok(resp.addon.manifest, 'has manifest')
+			// NOTE: this is an important design principle - immutability on the manifest object
+			t.deepEquals(resp.addon.manifest, manifest, 'addon.manifest is immutable')
+
+			const addonClient = resp.addon
+			return addonClient.get('stream', 'channel', '11')
+				.then(function(resp) {
+					t.ok(resp.streams, 'has streams')
+					t.deepEqual(resp.args, { type: 'channel', id: '11', extra: {}, config: {} }, 'args parsed right')
+					return addonClient.get('stream', 'channel', '11', { search: 'foobar' })
+				})
+				.then(function(resp) {
+					t.ok(resp.streams, 'has streams')
+					t.deepEqual(resp.args, { type: 'channel', id: '11', extra: { search: 'foobar' }, config: {} }, 'args parsed right')
+				})
+		})
+		.then(() => t.end())
+		.catch(function(err) {
+			t.error(err, 'error on addonClient')
+			t.end()
+		})
+})
+
+tape('getInterface: define a stream handler on the addon and test it', function(t) {
+	const addon = new addonBuilder(manifest)
+		.defineCatalogHandler(() => Promise.resolve({ metas: [] }))
+		.defineStreamHandler(function(args) {
+			t.equals(args.type, 'channel', 'args.type is right')
+			t.equals(args.id, '11', 'args.id is right')
+			t.deepEquals(args.extra, {}, 'args.extra is empty')
+			return Promise.resolve({streams:[]})
+		})
+	const addonInterface = addon.getInterface()
+	t.ok(addonInterface.manifest, 'interface has manifest')
+	addonInterface.manifest.name += 'foobar'
+	t.equal(addonInterface.manifest.name, manifest.name, 'interface.manifest is immutable')
+	addonInterface.get('stream', 'channel', '11')
+		.then(r => {
+			t.ok(r.streams, 'response has streams')
+		})
+		.then(() => t.end())
+		.catch(function(err) {
+			t.error(err, 'error on addonClient stream request')
+			t.end()
+		})
+})
+
+tape('defining the same handler throws', function(t) {
+	const addon = new addonBuilder(manifest)
+		.defineCatalogHandler(() => Promise.resolve({ metas: [] }))
+		.defineStreamHandler(() => Promise.resolve({ streams: [] }))
+	try {
+		addon.defineStreamHandler(() => Promise.resolve())
+	} catch(e) {
+		t.ok(e, 'has exception')
+		t.equal(e.message, 'handler for stream already defined')
+		t.end()
+	}
+})
+
+// publishToCentral publishes to the API
+tape('publishToCentral', function(t) {
+	publishToCentral('https://v3-cinemeta.strem.io/manifest.json')
+		.then(function(resp) {
+			t.equal(resp.success, true, 'can announce')
+			t.end()
+		})
+		.catch(function(err) {
+			t.error(err)
+			t.end()
+		})
+})
+
+tape.onFinish(function() {
+	// cause the server is still listening
+	addonServer.close()
+})
+
+
+
+---
+File: /_config.yml
+---
+
+theme: jekyll-theme-cayman
+
+
+---
+File: /.eslintrc.js
+---
+
+module.exports = {
+    "env": {
+        "node": true,
+        "commonjs": true,
+        "es6": true
+    },
+    "extends": "eslint:recommended",
+    "parserOptions": {
+        "ecmaVersion": 2018
+    },
+    "rules": {
+	"no-console": "off",
+        "indent": [
+            "error",
+            "tab"
+        ],
+        "linebreak-style": [
+            "error",
+            "unix"
+        ],
+        "quotes": [
+            "error",
+            "single"
+        ],
+        "semi": [
+            "error",
+            "never"
+        ]
+    }
+};
+
+
+
+---
+File: /.travis.yml
+---
+
+language: node_js
+node_js:
+  - "12"
+  - "14"
+
+
+
+---
+File: /LICENSE.md
+---
+
+The MIT License (MIT)
+=====================
+
+Copyright © 2019 SmartCode OOD
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the “Software”), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+
+---
+File: /package-lock.json
+---
+
+{
+  "name": "stremio-addon-sdk",
+  "version": "1.6.10",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "@babel/code-frame": {
+      "version": "7.0.0",
+      "resolved": "https://registry.npmjs.org/@babel/code-frame/-/code-frame-7.0.0.tgz",
+      "integrity": "sha512-OfC2uemaknXr87bdLUkWog7nYuliM9Ij5HUcajsVcMCpQrcLmtxRbVFTIqmcSkSeYRBFBRxs2FiUqFJDLdiebA==",
+      "dev": true,
+      "requires": {
+        "@babel/highlight": "^7.0.0"
+      }
+    },
+    "@babel/highlight": {
+      "version": "7.0.0",
+      "resolved": "https://registry.npmjs.org/@babel/highlight/-/highlight-7.0.0.tgz",
+      "integrity": "sha512-UFMC4ZeFC48Tpvj7C8UgLvtkaUuovQX+5xNWrsIoMG8o2z+XFKjKaN9iVmS84dPwVN00W4wPmqvYoZF3EGAsfw==",
+      "dev": true,
+      "requires": {
+        "chalk": "^2.0.0",
+        "esutils": "^2.0.2",
+        "js-tokens": "^4.0.0"
+      }
+    },
+    "accepts": {
+      "version": "1.3.5",
+      "resolved": "https://registry.npmjs.org/accepts/-/accepts-1.3.5.tgz",
+      "integrity": "sha1-63d99gEXI6OxTopywIBcjoZ0a9I=",
+      "requires": {
+        "mime-types": "~2.1.18",
+        "negotiator": "0.6.1"
+      }
+    },
+    "acorn": {
+      "version": "6.4.1",
+      "resolved": "https://registry.npmjs.org/acorn/-/acorn-6.4.1.tgz",
+      "integrity": "sha512-ZVA9k326Nwrj3Cj9jlh3wGFutC2ZornPNARZwsNYqQYgN0EsV2d53w5RN/co65Ohn4sUAUtb1rSUAOD6XN9idA==",
+      "dev": true
+    },
+    "acorn-jsx": {
+      "version": "5.0.1",
+      "resolved": "https://registry.npmjs.org/acorn-jsx/-/acorn-jsx-5.0.1.tgz",
+      "integrity": "sha512-HJ7CfNHrfJLlNTzIEUTj43LNWGkqpRLxm3YjAlcD0ACydk9XynzYsCBHxut+iqt+1aBXkx9UP/w/ZqMr13XIzg==",
+      "dev": true
+    },
+    "ajv": {
+      "version": "6.9.1",
+      "resolved": "https://registry.npmjs.org/ajv/-/ajv-6.9.1.tgz",
+      "integrity": "sha512-XDN92U311aINL77ieWHmqCcNlwjoP5cHXDxIxbf2MaPYuCXOHS7gHH8jktxeK5omgd52XbSTX6a4Piwd1pQmzA==",
+      "dev": true,
+      "requires": {
+        "fast-deep-equal": "^2.0.1",
+        "fast-json-stable-stringify": "^2.0.0",
+        "json-schema-traverse": "^0.4.1",
+        "uri-js": "^4.2.2"
+      }
+    },
+    "ansi-escapes": {
+      "version": "3.2.0",
+      "resolved": "https://registry.npmjs.org/ansi-escapes/-/ansi-escapes-3.2.0.tgz",
+      "integrity": "sha512-cBhpre4ma+U0T1oM5fXg7Dy1Jw7zzwv7lt/GoCpr+hDQJoYnKVPLL4dCvSEFMmQurOQvSrwT7SL/DAlhBI97RQ=="
+    },
+    "ansi-regex": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/ansi-regex/-/ansi-regex-3.0.0.tgz",
+      "integrity": "sha1-7QMXwyIGT3lGbAKWa922Bas32Zg="
+    },
+    "ansi-styles": {
+      "version": "3.2.1",
+      "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-3.2.1.tgz",
+      "integrity": "sha512-VT0ZI6kZRdTh8YyJw3SMbYm/u+NqfsAxEpWO0Pf9sq8/e94WxxOpPKx9FR1FlyCtOVDNOQ+8ntlqFxiRc+r5qA==",
+      "requires": {
+        "color-convert": "^1.9.0"
+      }
+    },
+    "argparse": {
+      "version": "1.0.10",
+      "resolved": "https://registry.npmjs.org/argparse/-/argparse-1.0.10.tgz",
+      "integrity": "sha512-o5Roy6tNG4SL/FOkCAN6RzjiakZS25RLYFrcMttJqbdd8BWrnA+fGz57iN5Pb06pvBGvl5gQ0B48dJlslXvoTg==",
+      "dev": true,
+      "requires": {
+        "sprintf-js": "~1.0.2"
+      }
+    },
+    "array-flatten": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/array-flatten/-/array-flatten-1.1.1.tgz",
+      "integrity": "sha1-ml9pkFGx5wczKPKgCJaLZOopVdI="
+    },
+    "astral-regex": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/astral-regex/-/astral-regex-1.0.0.tgz",
+      "integrity": "sha512-+Ryf6g3BKoRc7jfp7ad8tM4TtMiaWvbF/1/sQcZPkkS7ag3D5nMBCe2UfOTONtAkaG0tO0ij3C5Lwmf1EiyjHg==",
+      "dev": true
+    },
+    "asynckit": {
+      "version": "0.4.0",
+      "resolved": "https://registry.npmjs.org/asynckit/-/asynckit-0.4.0.tgz",
+      "integrity": "sha1-x57Zf380y48robyXkLzDZkdLS3k=",
+      "dev": true
+    },
+    "balanced-match": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.0.tgz",
+      "integrity": "sha1-ibTRmasr7kneFk6gK4nORi1xt2c=",
+      "dev": true
+    },
+    "body-parser": {
+      "version": "1.18.2",
+      "resolved": "https://registry.npmjs.org/body-parser/-/body-parser-1.18.2.tgz",
+      "integrity": "sha1-h2eKGdhLR9hZuDGZvVm84iKxBFQ=",
+      "requires": {
+        "bytes": "3.0.0",
+        "content-type": "~1.0.4",
+        "debug": "2.6.9",
+        "depd": "~1.1.1",
+        "http-errors": "~1.6.2",
+        "iconv-lite": "0.4.19",
+        "on-finished": "~2.3.0",
+        "qs": "6.5.1",
+        "raw-body": "2.3.2",
+        "type-is": "~1.6.15"
+      }
+    },
+    "brace-expansion": {
+      "version": "1.1.11",
+      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.11.tgz",
+      "integrity": "sha512-iCuPHDFgrHX7H2vEI/5xpz07zSHB00TpugqhmYtVmMO6518mCuRMoOYFldEBl0g187ufozdaHgWKcYFb61qGiA==",
+      "dev": true,
+      "requires": {
+        "balanced-match": "^1.0.0",
+        "concat-map": "0.0.1"
+      }
+    },
+    "bytes": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/bytes/-/bytes-3.0.0.tgz",
+      "integrity": "sha1-0ygVQE1olpn4Wk6k+odV3ROpYEg="
+    },
+    "callsites": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/callsites/-/callsites-3.0.0.tgz",
+      "integrity": "sha512-tWnkwu9YEq2uzlBDI4RcLn8jrFvF9AOi8PxDNU3hZZjJcjkcRAq3vCI+vZcg1SuxISDYe86k9VZFwAxDiJGoAw==",
+      "dev": true
+    },
+    "chalk": {
+      "version": "2.4.2",
+      "resolved": "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz",
+      "integrity": "sha512-Mti+f9lpJNcwF4tWV8/OrTTtF1gZi+f8FqlyAdouralcFWFQWF2+NgCHShjkCb+IFBLq9buZwE1xckQU4peSuQ==",
+      "requires": {
+        "ansi-styles": "^3.2.1",
+        "escape-string-regexp": "^1.0.5",
+        "supports-color": "^5.3.0"
+      }
+    },
+    "chardet": {
+      "version": "0.7.0",
+      "resolved": "https://registry.npmjs.org/chardet/-/chardet-0.7.0.tgz",
+      "integrity": "sha512-mT8iDcrh03qDGRRmoA2hmBJnxpllMR+0/0qlzjqZES6NdiWDcZkCNAk4rPFZ9Q85r27unkiNNg8ZOiwZXBHwcA=="
+    },
+    "circular-json": {
+      "version": "0.3.3",
+      "resolved": "https://registry.npmjs.org/circular-json/-/circular-json-0.3.3.tgz",
+      "integrity": "sha512-UZK3NBx2Mca+b5LsG7bY183pHWt5Y1xts4P3Pz7ENTwGVnJOUWbRb3ocjvX7hx9tq/yTAdclXm9sZ38gNuem4A==",
+      "dev": true
+    },
+    "cli-cursor": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/cli-cursor/-/cli-cursor-2.1.0.tgz",
+      "integrity": "sha1-s12sN2R5+sw+lHR9QdDQ9SOP/LU=",
+      "requires": {
+        "restore-cursor": "^2.0.0"
+      }
+    },
+    "cli-width": {
+      "version": "2.2.0",
+      "resolved": "https://registry.npmjs.org/cli-width/-/cli-width-2.2.0.tgz",
+      "integrity": "sha1-/xnt6Kml5XkyQUewwR8PvLq+1jk="
+    },
+    "color-convert": {
+      "version": "1.9.3",
+      "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-1.9.3.tgz",
+      "integrity": "sha512-QfAUtd+vFdAtFQcC8CCyYt1fYWxSqAiK2cSD6zDB8N3cpsEBAvRxp9zOGg6G/SHHJYAT88/az/IuDGALsNVbGg==",
+      "requires": {
+        "color-name": "1.1.3"
+      }
+    },
+    "color-name": {
+      "version": "1.1.3",
+      "resolved": "https://registry.npmjs.org/color-name/-/color-name-1.1.3.tgz",
+      "integrity": "sha1-p9BVi9icQveV3UIyj3QIMcpTvCU="
+    },
+    "combined-stream": {
+      "version": "1.0.7",
+      "resolved": "https://registry.npmjs.org/combined-stream/-/combined-stream-1.0.7.tgz",
+      "integrity": "sha512-brWl9y6vOB1xYPZcpZde3N9zDByXTosAeMDo4p1wzo6UMOX4vumB+TP1RZ76sfE6Md68Q0NJSrE/gbezd4Ul+w==",
+      "dev": true,
+      "requires": {
+        "delayed-stream": "~1.0.0"
+      }
+    },
+    "component-emitter": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.2.1.tgz",
+      "integrity": "sha1-E3kY1teCg/ffemt8WmPhQOaUJeY=",
+      "dev": true
+    },
+    "concat-map": {
+      "version": "0.0.1",
+      "resolved": "https://registry.npmjs.org/concat-map/-/concat-map-0.0.1.tgz",
+      "integrity": "sha1-2Klr13/Wjfd5OnMDajug1UBdR3s=",
+      "dev": true
+    },
+    "content-disposition": {
+      "version": "0.5.2",
+      "resolved": "https://registry.npmjs.org/content-disposition/-/content-disposition-0.5.2.tgz",
+      "integrity": "sha1-DPaLud318r55YcOoUXjLhdunjLQ="
+    },
+    "content-type": {
+      "version": "1.0.4",
+      "resolved": "https://registry.npmjs.org/content-type/-/content-type-1.0.4.tgz",
+      "integrity": "sha512-hIP3EEPs8tB9AT1L+NUqtwOAps4mk2Zob89MWXMHjHWg9milF/j4osnnQLXBCBFBk/tvIG/tUc9mOUJiPBhPXA=="
+    },
+    "cookie": {
+      "version": "0.3.1",
+      "resolved": "https://registry.npmjs.org/cookie/-/cookie-0.3.1.tgz",
+      "integrity": "sha1-5+Ch+e9DtMi6klxcWpboBtFoc7s="
+    },
+    "cookie-signature": {
+      "version": "1.0.6",
+      "resolved": "https://registry.npmjs.org/cookie-signature/-/cookie-signature-1.0.6.tgz",
+      "integrity": "sha1-4wOogrNCzD7oylE6eZmXNNqzriw="
+    },
+    "cookiejar": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/cookiejar/-/cookiejar-2.1.2.tgz",
+      "integrity": "sha512-Mw+adcfzPxcPeI+0WlvRrr/3lGVO0bD75SxX6811cxSh1Wbxx7xZBGK1eVtDf6si8rg2lhnUjsVLMFMfbRIuwA==",
+      "dev": true
+    },
+    "core-util-is": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/core-util-is/-/core-util-is-1.0.2.tgz",
+      "integrity": "sha1-tf1UIgqivFq1eqtxQMlAdUUDwac=",
+      "dev": true
+    },
+    "cors": {
+      "version": "2.8.4",
+      "resolved": "https://registry.npmjs.org/cors/-/cors-2.8.4.tgz",
+      "integrity": "sha1-K9OB8usgECAQXNUOpZ2mMJBpRoY=",
+      "requires": {
+        "object-assign": "^4",
+        "vary": "^1"
+      }
+    },
+    "cross-spawn": {
+      "version": "6.0.5",
+      "resolved": "https://registry.npmjs.org/cross-spawn/-/cross-spawn-6.0.5.tgz",
+      "integrity": "sha512-eTVLrBSt7fjbDygz805pMnstIs2VTBNkRm0qxZd+M7A5XDdxVRWO5MxGBXZhjY4cqLYLdtrGqRf8mBPmzwSpWQ==",
+      "dev": true,
+      "requires": {
+        "nice-try": "^1.0.4",
+        "path-key": "^2.0.1",
+        "semver": "^5.5.0",
+        "shebang-command": "^1.2.0",
+        "which": "^1.2.9"
+      }
+    },
+    "debug": {
+      "version": "2.6.9",
+      "resolved": "https://registry.npmjs.org/debug/-/debug-2.6.9.tgz",
+      "integrity": "sha512-bC7ElrdJaJnPbAP+1EotYvqZsb3ecl5wi6Bfi6BJTUcNowp6cvspg0jXznRTKDjm/E7AdgFBVeAPVMNcKGsHMA==",
+      "requires": {
+        "ms": "2.0.0"
+      }
+    },
+    "deep-equal": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/deep-equal/-/deep-equal-1.0.1.tgz",
+      "integrity": "sha1-9dJgKStmDghO/0zbyfCK0yR0SLU=",
+      "dev": true
+    },
+    "deep-is": {
+      "version": "0.1.3",
+      "resolved": "https://registry.npmjs.org/deep-is/-/deep-is-0.1.3.tgz",
+      "integrity": "sha1-s2nW+128E+7PUk+RsHD+7cNXzzQ=",
+      "dev": true
+    },
+    "define-properties": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/define-properties/-/define-properties-1.1.2.tgz",
+      "integrity": "sha1-g6c/L+pWmJj7c3GTyPhzyvbUXJQ=",
+      "dev": true,
+      "requires": {
+        "foreach": "^2.0.5",
+        "object-keys": "^1.0.8"
+      }
+    },
+    "defined": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/defined/-/defined-1.0.0.tgz",
+      "integrity": "sha1-yY2bzvdWdBiOEQlpFRGZ45sfppM=",
+      "dev": true
+    },
+    "delayed-stream": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/delayed-stream/-/delayed-stream-1.0.0.tgz",
+      "integrity": "sha1-3zrhmayt+31ECqrgsp4icrJOxhk=",
+      "dev": true
+    },
+    "depd": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/depd/-/depd-1.1.2.tgz",
+      "integrity": "sha1-m81S4UwJd2PnSbJ0xDRu0uVgtak="
+    },
+    "destroy": {
+      "version": "1.0.4",
+      "resolved": "https://registry.npmjs.org/destroy/-/destroy-1.0.4.tgz",
+      "integrity": "sha1-l4hXRCxEdJ5CBmE+N5RiBYJqvYA="
+    },
+    "doctrine": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/doctrine/-/doctrine-2.1.0.tgz",
+      "integrity": "sha512-35mSku4ZXK0vfCuHEDAwt55dg2jNajHZ1odvF+8SSr82EsZY4QmXfuWso8oEd8zRhVObSN18aM0CjSdoBX7zIw==",
+      "dev": true,
+      "requires": {
+        "esutils": "^2.0.2"
+      }
+    },
+    "ee-first": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/ee-first/-/ee-first-1.1.1.tgz",
+      "integrity": "sha1-WQxhFWsK4vTwJVcyoViyZrxWsh0="
+    },
+    "emoji-regex": {
+      "version": "7.0.3",
+      "resolved": "https://registry.npmjs.org/emoji-regex/-/emoji-regex-7.0.3.tgz",
+      "integrity": "sha512-CwBLREIQ7LvYFB0WyRvwhq5N5qPhc6PMjD6bYggFlI5YyDgl+0vxq5VHbMOFqLg7hfWzmu8T5Z1QofhmTIhItA==",
+      "dev": true
+    },
+    "encodeurl": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/encodeurl/-/encodeurl-1.0.2.tgz",
+      "integrity": "sha1-rT/0yG7C0CkyL1oCw6mmBslbP1k="
+    },
+    "es-abstract": {
+      "version": "1.11.0",
+      "resolved": "https://registry.npmjs.org/es-abstract/-/es-abstract-1.11.0.tgz",
+      "integrity": "sha512-ZnQrE/lXTTQ39ulXZ+J1DTFazV9qBy61x2bY071B+qGco8Z8q1QddsLdt/EF8Ai9hcWH72dWS0kFqXLxOxqslA==",
+      "dev": true,
+      "requires": {
+        "es-to-primitive": "^1.1.1",
+        "function-bind": "^1.1.1",
+        "has": "^1.0.1",
+        "is-callable": "^1.1.3",
+        "is-regex": "^1.0.4"
+      }
+    },
+    "es-to-primitive": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/es-to-primitive/-/es-to-primitive-1.1.1.tgz",
+      "integrity": "sha1-RTVSSKiJeQNLZ5Lhm7gfK3l13Q0=",
+      "dev": true,
+      "requires": {
+        "is-callable": "^1.1.1",
+        "is-date-object": "^1.0.1",
+        "is-symbol": "^1.0.1"
+      }
+    },
+    "escape-html": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/escape-html/-/escape-html-1.0.3.tgz",
+      "integrity": "sha1-Aljq5NPQwJdN4cFpGI7wBR0dGYg="
+    },
+    "escape-string-regexp": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-1.0.5.tgz",
+      "integrity": "sha1-G2HAViGQqN/2rjuyzwIAyhMLhtQ="
+    },
+    "eslint": {
+      "version": "5.13.0",
+      "resolved": "https://registry.npmjs.org/eslint/-/eslint-5.13.0.tgz",
+      "integrity": "sha512-nqD5WQMisciZC5EHZowejLKQjWGuFS5c70fxqSKlnDME+oz9zmE8KTlX+lHSg+/5wsC/kf9Q9eMkC8qS3oM2fg==",
+      "dev": true,
+      "requires": {
+        "@babel/code-frame": "^7.0.0",
+        "ajv": "^6.5.3",
+        "chalk": "^2.1.0",
+        "cross-spawn": "^6.0.5",
+        "debug": "^4.0.1",
+        "doctrine": "^2.1.0",
+        "eslint-scope": "^4.0.0",
+        "eslint-utils": "^1.3.1",
+        "eslint-visitor-keys": "^1.0.0",
+        "espree": "^5.0.0",
+        "esquery": "^1.0.1",
+        "esutils": "^2.0.2",
+        "file-entry-cache": "^2.0.0",
+        "functional-red-black-tree": "^1.0.1",
+        "glob": "^7.1.2",
+        "globals": "^11.7.0",
+        "ignore": "^4.0.6",
+        "import-fresh": "^3.0.0",
+        "imurmurhash": "^0.1.4",
+        "inquirer": "^6.1.0",
+        "js-yaml": "^3.12.0",
+        "json-stable-stringify-without-jsonify": "^1.0.1",
+        "levn": "^0.3.0",
+        "lodash": "^4.17.5",
+        "minimatch": "^3.0.4",
+        "mkdirp": "^0.5.1",
+        "natural-compare": "^1.4.0",
+        "optionator": "^0.8.2",
+        "path-is-inside": "^1.0.2",
+        "progress": "^2.0.0",
+        "regexpp": "^2.0.1",
+        "semver": "^5.5.1",
+        "strip-ansi": "^4.0.0",
+        "strip-json-comments": "^2.0.1",
+        "table": "^5.0.2",
+        "text-table": "^0.2.0"
+      },
+      "dependencies": {
+        "debug": {
+          "version": "4.1.1",
+          "resolved": "https://registry.npmjs.org/debug/-/debug-4.1.1.tgz",
+          "integrity": "sha512-pYAIzeRo8J6KPEaJ0VWOh5Pzkbw/RetuzehGM7QRRX5he4fPHx2rdKMB256ehJCkX+XRQm16eZLqLNS8RSZXZw==",
+          "dev": true,
+          "requires": {
+            "ms": "^2.1.1"
+          }
+        },
+        "ms": {
+          "version": "2.1.1",
+          "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.1.tgz",
+          "integrity": "sha512-tgp+dl5cGk28utYktBsrFqA7HKgrhgPsg6Z/EfhWI4gl1Hwq8B/GmY/0oXZ6nF8hDVesS/FpnYaD/kOWhYQvyg==",
+          "dev": true
+        }
+      }
+    },
+    "eslint-scope": {
+      "version": "4.0.0",
+      "resolved": "https://registry.npmjs.org/eslint-scope/-/eslint-scope-4.0.0.tgz",
+      "integrity": "sha512-1G6UTDi7Jc1ELFwnR58HV4fK9OQK4S6N985f166xqXxpjU6plxFISJa2Ba9KCQuFa8RCnj/lSFJbHo7UFDBnUA==",
+      "dev": true,
+      "requires": {
+        "esrecurse": "^4.1.0",
+        "estraverse": "^4.1.1"
+      }
+    },
+    "eslint-utils": {
+      "version": "1.4.2",
+      "resolved": "https://registry.npmjs.org/eslint-utils/-/eslint-utils-1.4.2.tgz",
+      "integrity": "sha512-eAZS2sEUMlIeCjBeubdj45dmBHQwPHWyBcT1VSYB7o9x9WRRqKxyUoiXlRjyAwzN7YEzHJlYg0NmzDRWx6GP4Q==",
+      "dev": true,
+      "requires": {
+        "eslint-visitor-keys": "^1.0.0"
+      }
+    },
+    "eslint-visitor-keys": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/eslint-visitor-keys/-/eslint-visitor-keys-1.0.0.tgz",
+      "integrity": "sha512-qzm/XxIbxm/FHyH341ZrbnMUpe+5Bocte9xkmFMzPMjRaZMcXww+MpBptFvtU+79L362nqiLhekCxCxDPaUMBQ==",
+      "dev": true
+    },
+    "espree": {
+      "version": "5.0.0",
+      "resolved": "https://registry.npmjs.org/espree/-/espree-5.0.0.tgz",
+      "integrity": "sha512-1MpUfwsdS9MMoN7ZXqAr9e9UKdVHDcvrJpyx7mm1WuQlx/ygErEQBzgi5Nh5qBHIoYweprhtMkTCb9GhcAIcsA==",
+      "dev": true,
+      "requires": {
+        "acorn": "^6.0.2",
+        "acorn-jsx": "^5.0.0",
+        "eslint-visitor-keys": "^1.0.0"
+      }
+    },
+    "esprima": {
+      "version": "4.0.1",
+      "resolved": "https://registry.npmjs.org/esprima/-/esprima-4.0.1.tgz",
+      "integrity": "sha512-eGuFFw7Upda+g4p+QHvnW0RyTX/SVeJBDM/gCtMARO0cLuT2HcEKnTPvhjV6aGeqrCB/sbNop0Kszm0jsaWU4A==",
+      "dev": true
+    },
+    "esquery": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/esquery/-/esquery-1.0.1.tgz",
+      "integrity": "sha512-SmiyZ5zIWH9VM+SRUReLS5Q8a7GxtRdxEBVZpm98rJM7Sb+A9DVCndXfkeFUd3byderg+EbDkfnevfCwynWaNA==",
+      "dev": true,
+      "requires": {
+        "estraverse": "^4.0.0"
+      }
+    },
+    "esrecurse": {
+      "version": "4.2.1",
+      "resolved": "https://registry.npmjs.org/esrecurse/-/esrecurse-4.2.1.tgz",
+      "integrity": "sha512-64RBB++fIOAXPw3P9cy89qfMlvZEXZkqqJkjqqXIvzP5ezRZjW+lPWjw35UX/3EhUPFYbg5ER4JYgDw4007/DQ==",
+      "dev": true,
+      "requires": {
+        "estraverse": "^4.1.0"
+      }
+    },
+    "estraverse": {
+      "version": "4.2.0",
+      "resolved": "https://registry.npmjs.org/estraverse/-/estraverse-4.2.0.tgz",
+      "integrity": "sha1-De4/7TH81GlhjOc0IJn8GvoL2xM=",
+      "dev": true
+    },
+    "esutils": {
+      "version": "2.0.2",
+      "resolved": "https://registry.npmjs.org/esutils/-/esutils-2.0.2.tgz",
+      "integrity": "sha1-Cr9PHKpbyx96nYrMbepPqqBLrJs=",
+      "dev": true
+    },
+    "etag": {
+      "version": "1.8.1",
+      "resolved": "https://registry.npmjs.org/etag/-/etag-1.8.1.tgz",
+      "integrity": "sha1-Qa4u62XvpiJorr/qg6x9eSmbCIc="
+    },
+    "express": {
+      "version": "4.16.3",
+      "resolved": "https://registry.npmjs.org/express/-/express-4.16.3.tgz",
+      "integrity": "sha1-avilAjUNsyRuzEvs9rWjTSL37VM=",
+      "requires": {
+        "accepts": "~1.3.5",
+        "array-flatten": "1.1.1",
+        "body-parser": "1.18.2",
+        "content-disposition": "0.5.2",
+        "content-type": "~1.0.4",
+        "cookie": "0.3.1",
+        "cookie-signature": "1.0.6",
+        "debug": "2.6.9",
+        "depd": "~1.1.2",
+        "encodeurl": "~1.0.2",
+        "escape-html": "~1.0.3",
+        "etag": "~1.8.1",
+        "finalhandler": "1.1.1",
+        "fresh": "0.5.2",
+        "merge-descriptors": "1.0.1",
+        "methods": "~1.1.2",
+        "on-finished": "~2.3.0",
+        "parseurl": "~1.3.2",
+        "path-to-regexp": "0.1.7",
+        "proxy-addr": "~2.0.3",
+        "qs": "6.5.1",
+        "range-parser": "~1.2.0",
+        "safe-buffer": "5.1.1",
+        "send": "0.16.2",
+        "serve-static": "1.13.2",
+        "setprototypeof": "1.1.0",
+        "statuses": "~1.4.0",
+        "type-is": "~1.6.16",
+        "utils-merge": "1.0.1",
+        "vary": "~1.1.2"
+      }
+    },
+    "extend": {
+      "version": "3.0.2",
+      "resolved": "https://registry.npmjs.org/extend/-/extend-3.0.2.tgz",
+      "integrity": "sha512-fjquC59cD7CyW6urNXK0FBufkZcoiGG80wTuPujX590cB5Ttln20E2UB4S/WARVqhXffZl2LNgS+gQdPIIim/g==",
+      "dev": true
+    },
+    "external-editor": {
+      "version": "3.0.3",
+      "resolved": "https://registry.npmjs.org/external-editor/-/external-editor-3.0.3.tgz",
+      "integrity": "sha512-bn71H9+qWoOQKyZDo25mOMVpSmXROAsTJVVVYzrrtol3d4y+AsKjf4Iwl2Q+IuT0kFSQ1qo166UuIwqYq7mGnA==",
+      "requires": {
+        "chardet": "^0.7.0",
+        "iconv-lite": "^0.4.24",
+        "tmp": "^0.0.33"
+      },
+      "dependencies": {
+        "iconv-lite": {
+          "version": "0.4.24",
+          "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.4.24.tgz",
+          "integrity": "sha512-v3MXnZAcvnywkTUEZomIActle7RXXeedOR31wwl7VlyoXO4Qi9arvSenNQWne1TcRwhCL1HwLI21bEqdpj8/rA==",
+          "requires": {
+            "safer-buffer": ">= 2.1.2 < 3"
+          }
+        }
+      }
+    },
+    "fast-deep-equal": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-2.0.1.tgz",
+      "integrity": "sha1-ewUhjd+WZ79/Nwv3/bLLFf3Qqkk=",
+      "dev": true
+    },
+    "fast-json-stable-stringify": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/fast-json-stable-stringify/-/fast-json-stable-stringify-2.0.0.tgz",
+      "integrity": "sha1-1RQsDK7msRifh9OnYREGT4bIu/I=",
+      "dev": true
+    },
+    "fast-levenshtein": {
+      "version": "2.0.6",
+      "resolved": "https://registry.npmjs.org/fast-levenshtein/-/fast-levenshtein-2.0.6.tgz",
+      "integrity": "sha1-PYpcZog6FqMMqGQ+hR8Zuqd5eRc=",
+      "dev": true
+    },
+    "figures": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/figures/-/figures-2.0.0.tgz",
+      "integrity": "sha1-OrGi0qYsi/tDGgyUy3l6L84nyWI=",
+      "requires": {
+        "escape-string-regexp": "^1.0.5"
+      }
+    },
+    "file-entry-cache": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/file-entry-cache/-/file-entry-cache-2.0.0.tgz",
+      "integrity": "sha1-w5KZDD5oR4PYOLjISkXYoEhFg2E=",
+      "dev": true,
+      "requires": {
+        "flat-cache": "^1.2.1",
+        "object-assign": "^4.0.1"
+      }
+    },
+    "finalhandler": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/finalhandler/-/finalhandler-1.1.1.tgz",
+      "integrity": "sha512-Y1GUDo39ez4aHAw7MysnUD5JzYX+WaIj8I57kO3aEPT1fFRL4sr7mjei97FgnwhAyyzRYmQZaTHb2+9uZ1dPtg==",
+      "requires": {
+        "debug": "2.6.9",
+        "encodeurl": "~1.0.2",
+        "escape-html": "~1.0.3",
+        "on-finished": "~2.3.0",
+        "parseurl": "~1.3.2",
+        "statuses": "~1.4.0",
+        "unpipe": "~1.0.0"
+      }
+    },
+    "flat-cache": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/flat-cache/-/flat-cache-1.3.4.tgz",
+      "integrity": "sha512-VwyB3Lkgacfik2vhqR4uv2rvebqmDvFu4jlN/C1RzWoJEo8I7z4Q404oiqYCkq41mni8EzQnm95emU9seckwtg==",
+      "dev": true,
+      "requires": {
+        "circular-json": "^0.3.1",
+        "graceful-fs": "^4.1.2",
+        "rimraf": "~2.6.2",
+        "write": "^0.2.1"
+      }
+    },
+    "for-each": {
+      "version": "0.3.2",
+      "resolved": "https://registry.npmjs.org/for-each/-/for-each-0.3.2.tgz",
+      "integrity": "sha1-LEBFC5NI6X8oEyJZO6lnBLmr1NQ=",
+      "dev": true,
+      "requires": {
+        "is-function": "~1.0.0"
+      }
+    },
+    "foreach": {
+      "version": "2.0.5",
+      "resolved": "https://registry.npmjs.org/foreach/-/foreach-2.0.5.tgz",
+      "integrity": "sha1-C+4AUBiusmDQo6865ljdATbsG5k=",
+      "dev": true
+    },
+    "form-data": {
+      "version": "2.3.3",
+      "resolved": "https://registry.npmjs.org/form-data/-/form-data-2.3.3.tgz",
+      "integrity": "sha512-1lLKB2Mu3aGP1Q/2eCOx0fNbRMe7XdwktwOruhfqqd0rIJWwN4Dh+E3hrPSlDCXnSR7UtZ1N38rVXm+6+MEhJQ==",
+      "dev": true,
+      "requires": {
+        "asynckit": "^0.4.0",
+        "combined-stream": "^1.0.6",
+        "mime-types": "^2.1.12"
+      }
+    },
+    "formidable": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/formidable/-/formidable-1.2.1.tgz",
+      "integrity": "sha512-Fs9VRguL0gqGHkXS5GQiMCr1VhZBxz0JnJs4JmMp/2jL18Fmbzvv7vOFRU+U8TBkHEE/CX1qDXzJplVULgsLeg==",
+      "dev": true
+    },
+    "forwarded": {
+      "version": "0.1.2",
+      "resolved": "https://registry.npmjs.org/forwarded/-/forwarded-0.1.2.tgz",
+      "integrity": "sha1-mMI9qxF1ZXuMBXPozszZGw/xjIQ="
+    },
+    "fresh": {
+      "version": "0.5.2",
+      "resolved": "https://registry.npmjs.org/fresh/-/fresh-0.5.2.tgz",
+      "integrity": "sha1-PYyt2Q2XZWn6g1qx+OSyOhBWBac="
+    },
+    "fs.realpath": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/fs.realpath/-/fs.realpath-1.0.0.tgz",
+      "integrity": "sha1-FQStJSMVjKpA20onh8sBQRmU6k8=",
+      "dev": true
+    },
+    "function-bind": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/function-bind/-/function-bind-1.1.1.tgz",
+      "integrity": "sha512-yIovAzMX49sF8Yl58fSCWJ5svSLuaibPxXQJFLmBObTuCr0Mf1KiPopGM9NiFjiYBCbfaa2Fh6breQ6ANVTI0A==",
+      "dev": true
+    },
+    "functional-red-black-tree": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/functional-red-black-tree/-/functional-red-black-tree-1.0.1.tgz",
+      "integrity": "sha1-GwqzvVU7Kg1jmdKcDj6gslIHgyc=",
+      "dev": true
+    },
+    "glob": {
+      "version": "7.1.2",
+      "resolved": "https://registry.npmjs.org/glob/-/glob-7.1.2.tgz",
+      "integrity": "sha512-MJTUg1kjuLeQCJ+ccE4Vpa6kKVXkPYJ2mOCQyUuKLcLQsdrMCpBPUi8qVE6+YuaJkozeA9NusTAw3hLr8Xe5EQ==",
+      "dev": true,
+      "requires": {
+        "fs.realpath": "^1.0.0",
+        "inflight": "^1.0.4",
+        "inherits": "2",
+        "minimatch": "^3.0.4",
+        "once": "^1.3.0",
+        "path-is-absolute": "^1.0.0"
+      }
+    },
+    "globals": {
+      "version": "11.11.0",
+      "resolved": "https://registry.npmjs.org/globals/-/globals-11.11.0.tgz",
+      "integrity": "sha512-WHq43gS+6ufNOEqlrDBxVEbb8ntfXrfAUU2ZOpCxrBdGKW3gyv8mCxAfIBD0DroPKGrJ2eSsXsLtY9MPntsyTw==",
+      "dev": true
+    },
+    "graceful-fs": {
+      "version": "4.1.15",
+      "resolved": "https://registry.npmjs.org/graceful-fs/-/graceful-fs-4.1.15.tgz",
+      "integrity": "sha512-6uHUhOPEBgQ24HM+r6b/QwWfZq+yiFcipKFrOFiBEnWdy5sdzYoi+pJeQaPI5qOLRFqWmAXUPQNsielzdLoecA==",
+      "dev": true
+    },
+    "has": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/has/-/has-1.0.1.tgz",
+      "integrity": "sha1-hGFzP1OLCDfJNh45qauelwTcLyg=",
+      "dev": true,
+      "requires": {
+        "function-bind": "^1.0.2"
+      }
+    },
+    "has-flag": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-3.0.0.tgz",
+      "integrity": "sha1-tdRU3CGZriJWmfNGfloH87lVuv0="
+    },
+    "http-errors": {
+      "version": "1.6.2",
+      "resolved": "https://registry.npmjs.org/http-errors/-/http-errors-1.6.2.tgz",
+      "integrity": "sha1-CgAsyFcHGSp+eUbO7cERVfYOxzY=",
+      "requires": {
+        "depd": "1.1.1",
+        "inherits": "2.0.3",
+        "setprototypeof": "1.0.3",
+        "statuses": ">= 1.3.1 < 2"
+      },
+      "dependencies": {
+        "depd": {
+          "version": "1.1.1",
+          "resolved": "https://registry.npmjs.org/depd/-/depd-1.1.1.tgz",
+          "integrity": "sha1-V4O04cRZ8G+lyif5kfPQbnoxA1k="
+        },
+        "setprototypeof": {
+          "version": "1.0.3",
+          "resolved": "https://registry.npmjs.org/setprototypeof/-/setprototypeof-1.0.3.tgz",
+          "integrity": "sha1-ZlZ+NwQ+608E2RvWWMDL77VbjgQ="
+        }
+      }
+    },
+    "iconv-lite": {
+      "version": "0.4.19",
+      "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.4.19.tgz",
+      "integrity": "sha512-oTZqweIP51xaGPI4uPa56/Pri/480R+mo7SeU+YETByQNhDG55ycFyNLIgta9vXhILrxXDmF7ZGhqZIcuN0gJQ=="
+    },
+    "ignore": {
+      "version": "4.0.6",
+      "resolved": "https://registry.npmjs.org/ignore/-/ignore-4.0.6.tgz",
+      "integrity": "sha512-cyFDKrqc/YdcWFniJhzI42+AzS+gNwmUzOSFcRCQYwySuBBBy/KjuxWLZ/FHEH6Moq1NizMOBWyTcv8O4OZIMg==",
+      "dev": true
+    },
+    "import-fresh": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/import-fresh/-/import-fresh-3.0.0.tgz",
+      "integrity": "sha512-pOnA9tfM3Uwics+SaBLCNyZZZbK+4PTu0OPZtLlMIrv17EdBoC15S9Kn8ckJ9TZTyKb3ywNE5y1yeDxxGA7nTQ==",
+      "dev": true,
+      "requires": {
+        "parent-module": "^1.0.0",
+        "resolve-from": "^4.0.0"
+      }
+    },
+    "imurmurhash": {
+      "version": "0.1.4",
+      "resolved": "https://registry.npmjs.org/imurmurhash/-/imurmurhash-0.1.4.tgz",
+      "integrity": "sha1-khi5srkoojixPcT7a21XbyMUU+o=",
+      "dev": true
+    },
+    "inflight": {
+      "version": "1.0.6",
+      "resolved": "https://registry.npmjs.org/inflight/-/inflight-1.0.6.tgz",
+      "integrity": "sha1-Sb1jMdfQLQwJvJEKEHW6gWW1bfk=",
+      "dev": true,
+      "requires": {
+        "once": "^1.3.0",
+        "wrappy": "1"
+      }
+    },
+    "inherits": {
+      "version": "2.0.3",
+      "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.3.tgz",
+      "integrity": "sha1-Yzwsg+PaQqUC9SRmAiSA9CCCYd4="
+    },
+    "inquirer": {
+      "version": "6.2.2",
+      "resolved": "https://registry.npmjs.org/inquirer/-/inquirer-6.2.2.tgz",
+      "integrity": "sha512-Z2rREiXA6cHRR9KBOarR3WuLlFzlIfAEIiB45ll5SSadMg7WqOh1MKEjjndfuH5ewXdixWCxqnVfGOQzPeiztA==",
+      "requires": {
+        "ansi-escapes": "^3.2.0",
+        "chalk": "^2.4.2",
+        "cli-cursor": "^2.1.0",
+        "cli-width": "^2.0.0",
+        "external-editor": "^3.0.3",
+        "figures": "^2.0.0",
+        "lodash": "^4.17.11",
+        "mute-stream": "0.0.7",
+        "run-async": "^2.2.0",
+        "rxjs": "^6.4.0",
+        "string-width": "^2.1.0",
+        "strip-ansi": "^5.0.0",
+        "through": "^2.3.6"
+      },
+      "dependencies": {
+        "ansi-regex": {
+          "version": "4.0.0",
+          "resolved": "https://registry.npmjs.org/ansi-regex/-/ansi-regex-4.0.0.tgz",
+          "integrity": "sha512-iB5Dda8t/UqpPI/IjsejXu5jOGDrzn41wJyljwPH65VCIbk6+1BzFIMJGFwTNrYXT1CrD+B4l19U7awiQ8rk7w=="
+        },
+        "strip-ansi": {
+          "version": "5.0.0",
+          "resolved": "https://registry.npmjs.org/strip-ansi/-/strip-ansi-5.0.0.tgz",
+          "integrity": "sha512-Uu7gQyZI7J7gn5qLn1Np3G9vcYGTVqB+lFTytnDJv83dd8T22aGH451P3jueT2/QemInJDfxHB5Tde5OzgG1Ow==",
+          "requires": {
+            "ansi-regex": "^4.0.0"
+          }
+        }
+      }
+    },
+    "ipaddr.js": {
+      "version": "1.6.0",
+      "resolved": "https://registry.npmjs.org/ipaddr.js/-/ipaddr.js-1.6.0.tgz",
+      "integrity": "sha1-4/o1e3c9phnybpXwSdBVxyeW+Gs="
+    },
+    "is-callable": {
+      "version": "1.1.3",
+      "resolved": "https://registry.npmjs.org/is-callable/-/is-callable-1.1.3.tgz",
+      "integrity": "sha1-hut1OSgF3cM69xySoO7fdO52BLI=",
+      "dev": true
+    },
+    "is-date-object": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/is-date-object/-/is-date-object-1.0.1.tgz",
+      "integrity": "sha1-mqIOtq7rv/d/vTPnTKAbM1gdOhY=",
+      "dev": true
+    },
+    "is-fullwidth-code-point": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/is-fullwidth-code-point/-/is-fullwidth-code-point-2.0.0.tgz",
+      "integrity": "sha1-o7MKXE8ZkYMWeqq5O+764937ZU8="
+    },
+    "is-function": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/is-function/-/is-function-1.0.1.tgz",
+      "integrity": "sha1-Es+5i2W1fdPRk6MSH19uL0N2ArU=",
+      "dev": true
+    },
+    "is-promise": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/is-promise/-/is-promise-2.1.0.tgz",
+      "integrity": "sha1-eaKp7OfwlugPNtKy87wWwf9L8/o="
+    },
+    "is-regex": {
+      "version": "1.0.4",
+      "resolved": "https://registry.npmjs.org/is-regex/-/is-regex-1.0.4.tgz",
+      "integrity": "sha1-VRdIm1RwkbCTDglWVM7SXul+lJE=",
+      "dev": true,
+      "requires": {
+        "has": "^1.0.1"
+      }
+    },
+    "is-symbol": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/is-symbol/-/is-symbol-1.0.1.tgz",
+      "integrity": "sha1-PMWfAAJRlLarLjjbrmaJJWtmBXI=",
+      "dev": true
+    },
+    "is-wsl": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/is-wsl/-/is-wsl-1.1.0.tgz",
+      "integrity": "sha1-HxbkqiKwTRM2tmGIpmrzxgDDpm0="
+    },
+    "isarray": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/isarray/-/isarray-1.0.0.tgz",
+      "integrity": "sha1-u5NdSFgsuhaMBoNJV6VKPgcSTxE=",
+      "dev": true
+    },
+    "isexe": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/isexe/-/isexe-2.0.0.tgz",
+      "integrity": "sha1-6PvzdNxVb/iUehDcsFctYz8s+hA=",
+      "dev": true
+    },
+    "js-tokens": {
+      "version": "4.0.0",
+      "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
+      "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
+      "dev": true
+    },
+    "js-yaml": {
+      "version": "3.13.1",
+      "resolved": "https://registry.npmjs.org/js-yaml/-/js-yaml-3.13.1.tgz",
+      "integrity": "sha512-YfbcO7jXDdyj0DGxYVSlSeQNHbD7XPWvrVWeVUujrQEoZzWJIRrCPoyk6kL6IAjAG2IolMK4T0hNUe0HOUs5Jw==",
+      "dev": true,
+      "requires": {
+        "argparse": "^1.0.7",
+        "esprima": "^4.0.0"
+      }
+    },
+    "json-schema-traverse": {
+      "version": "0.4.1",
+      "resolved": "https://registry.npmjs.org/json-schema-traverse/-/json-schema-traverse-0.4.1.tgz",
+      "integrity": "sha512-xbbCH5dCYU5T8LcEhhuh7HJ88HXuW3qsI3Y0zOZFKfZEHcpWiHU/Jxzk629Brsab/mMiHQti9wMP+845RPe3Vg==",
+      "dev": true
+    },
+    "json-stable-stringify-without-jsonify": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/json-stable-stringify-without-jsonify/-/json-stable-stringify-without-jsonify-1.0.1.tgz",
+      "integrity": "sha1-nbe1lJatPzz+8wp1FC0tkwrXJlE=",
+      "dev": true
+    },
+    "levn": {
+      "version": "0.3.0",
+      "resolved": "https://registry.npmjs.org/levn/-/levn-0.3.0.tgz",
+      "integrity": "sha1-OwmSTt+fCDwEkP3UwLxEIeBHZO4=",
+      "dev": true,
+      "requires": {
+        "prelude-ls": "~1.1.2",
+        "type-check": "~0.3.2"
+      }
+    },
+    "lodash": {
+      "version": "4.17.21",
+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+      "integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+    },
+    "media-typer": {
+      "version": "0.3.0",
+      "resolved": "https://registry.npmjs.org/media-typer/-/media-typer-0.3.0.tgz",
+      "integrity": "sha1-hxDXrwqmJvj/+hzgAWhUUmMlV0g="
+    },
+    "merge-descriptors": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/merge-descriptors/-/merge-descriptors-1.0.1.tgz",
+      "integrity": "sha1-sAqqVW3YtEVoFQ7J0blT8/kMu2E="
+    },
+    "methods": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/methods/-/methods-1.1.2.tgz",
+      "integrity": "sha1-VSmk1nZUE07cxSZmVoNbD4Ua/O4="
+    },
+    "mime-db": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/mime-db/-/mime-db-1.33.0.tgz",
+      "integrity": "sha512-BHJ/EKruNIqJf/QahvxwQZXKygOQ256myeN/Ew+THcAa5q+PjyTTMMeNQC4DZw5AwfvelsUrA6B67NKMqXDbzQ=="
+    },
+    "mime-types": {
+      "version": "2.1.18",
+      "resolved": "https://registry.npmjs.org/mime-types/-/mime-types-2.1.18.tgz",
+      "integrity": "sha512-lc/aahn+t4/SWV/qcmumYjymLsWfN3ELhpmVuUFjgsORruuZPVSwAQryq+HHGvO/SI2KVX26bx+En+zhM8g8hQ==",
+      "requires": {
+        "mime-db": "~1.33.0"
+      }
+    },
+    "mimic-fn": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/mimic-fn/-/mimic-fn-1.2.0.tgz",
+      "integrity": "sha512-jf84uxzwiuiIVKiOLpfYk7N46TSy8ubTonmneY9vrpHNAnp0QBt2BxWV9dO3/j+BoVAb+a5G6YDPW3M5HOdMWQ=="
+    },
+    "minimatch": {
+      "version": "3.0.4",
+      "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-3.0.4.tgz",
+      "integrity": "sha512-yJHVQEhyqPLUTgt9B83PXu6W3rx4MvvHvSUvToogpwoGDOUQ+yDrR0HRot+yOCdCO7u4hX3pWft6kWBBcqh0UA==",
+      "dev": true,
+      "requires": {
+        "brace-expansion": "^1.1.7"
+      }
+    },
+    "minimist": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.0.tgz",
+      "integrity": "sha1-o1AIsg9BOD7sH7kU9M1d95omQoQ=",
+      "dev": true
+    },
+    "mkdirp": {
+      "version": "0.5.1",
+      "resolved": "https://registry.npmjs.org/mkdirp/-/mkdirp-0.5.1.tgz",
+      "integrity": "sha1-MAV0OOrGz3+MR2fzhkjWaX11yQM=",
+      "requires": {
+        "minimist": "0.0.8"
+      },
+      "dependencies": {
+        "minimist": {
+          "version": "0.0.8",
+          "resolved": "https://registry.npmjs.org/minimist/-/minimist-0.0.8.tgz",
+          "integrity": "sha1-hX/Kv8M5fSYluCKCYuhqp6ARsF0="
+        }
+      }
+    },
+    "ms": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
+      "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
+    },
+    "mute-stream": {
+      "version": "0.0.7",
+      "resolved": "https://registry.npmjs.org/mute-stream/-/mute-stream-0.0.7.tgz",
+      "integrity": "sha1-MHXOk7whuPq0PhvE2n6BFe0ee6s="
+    },
+    "natural-compare": {
+      "version": "1.4.0",
+      "resolved": "https://registry.npmjs.org/natural-compare/-/natural-compare-1.4.0.tgz",
+      "integrity": "sha1-Sr6/7tdUHywnrPspvbvRXI1bpPc=",
+      "dev": true
+    },
+    "negotiator": {
+      "version": "0.6.1",
+      "resolved": "https://registry.npmjs.org/negotiator/-/negotiator-0.6.1.tgz",
+      "integrity": "sha1-KzJxhOiZIQEXeyhWP7XnECrNDKk="
+    },
+    "nice-try": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/nice-try/-/nice-try-1.0.5.tgz",
+      "integrity": "sha512-1nh45deeb5olNY7eX82BkPO7SSxR5SSYJiPTrTdFUVYwAl8CKMA5N9PjTYkHiRjisVcxcQ1HXdLhx2qxxJzLNQ==",
+      "dev": true
+    },
+    "node-fetch": {
+      "version": "2.6.1",
+      "resolved": "https://registry.npmjs.org/node-fetch/-/node-fetch-2.6.1.tgz",
+      "integrity": "sha512-V4aYg89jEoVRxRb2fJdAg8FHvI7cEyYdVAh94HH0UIK8oJxUfkjlDQN9RbMx+bEjP7+ggMiFRprSti032Oipxw=="
+    },
+    "object-assign": {
+      "version": "4.1.1",
+      "resolved": "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz",
+      "integrity": "sha1-IQmtx5ZYh8/AXLvUQsrIv7s2CGM="
+    },
+    "object-inspect": {
+      "version": "1.5.0",
+      "resolved": "https://registry.npmjs.org/object-inspect/-/object-inspect-1.5.0.tgz",
+      "integrity": "sha512-UmOFbHbwvv+XHj7BerrhVq+knjceBdkvU5AriwLMvhv2qi+e7DJzxfBeFpILEjVzCp+xA+W/pIf06RGPWlZNfw==",
+      "dev": true
+    },
+    "object-keys": {
+      "version": "1.0.11",
+      "resolved": "https://registry.npmjs.org/object-keys/-/object-keys-1.0.11.tgz",
+      "integrity": "sha1-xUYBd4rVYPEULODgG8yotW0TQm0=",
+      "dev": true
+    },
+    "on-finished": {
+      "version": "2.3.0",
+      "resolved": "https://registry.npmjs.org/on-finished/-/on-finished-2.3.0.tgz",
+      "integrity": "sha1-IPEzZIGwg811M3mSoWlxqi2QaUc=",
+      "requires": {
+        "ee-first": "1.1.1"
+      }
+    },
+    "once": {
+      "version": "1.4.0",
+      "resolved": "https://registry.npmjs.org/once/-/once-1.4.0.tgz",
+      "integrity": "sha1-WDsap3WWHUsROsF9nFC6753Xa9E=",
+      "dev": true,
+      "requires": {
+        "wrappy": "1"
+      }
+    },
+    "onetime": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/onetime/-/onetime-2.0.1.tgz",
+      "integrity": "sha1-BnQoIw/WdEOyeUsiu6UotoZ5YtQ=",
+      "requires": {
+        "mimic-fn": "^1.0.0"
+      }
+    },
+    "opn": {
+      "version": "5.4.0",
+      "resolved": "https://registry.npmjs.org/opn/-/opn-5.4.0.tgz",
+      "integrity": "sha512-YF9MNdVy/0qvJvDtunAOzFw9iasOQHpVthTCvGzxt61Il64AYSGdK+rYwld7NAfk9qJ7dt+hymBNSc9LNYS+Sw==",
+      "requires": {
+        "is-wsl": "^1.1.0"
+      }
+    },
+    "optionator": {
+      "version": "0.8.2",
+      "resolved": "https://registry.npmjs.org/optionator/-/optionator-0.8.2.tgz",
+      "integrity": "sha1-NkxeQJ0/TWMB1sC0wFu6UBgK62Q=",
+      "dev": true,
+      "requires": {
+        "deep-is": "~0.1.3",
+        "fast-levenshtein": "~2.0.4",
+        "levn": "~0.3.0",
+        "prelude-ls": "~1.1.2",
+        "type-check": "~0.3.2",
+        "wordwrap": "~1.0.0"
+      }
+    },
+    "os-tmpdir": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/os-tmpdir/-/os-tmpdir-1.0.2.tgz",
+      "integrity": "sha1-u+Z0BseaqFxc/sdm/lc0VV36EnQ="
+    },
+    "parent-module": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/parent-module/-/parent-module-1.0.0.tgz",
+      "integrity": "sha512-8Mf5juOMmiE4FcmzYc4IaiS9L3+9paz2KOiXzkRviCP6aDmN49Hz6EMWz0lGNp9pX80GvvAuLADtyGfW/Em3TA==",
+      "dev": true,
+      "requires": {
+        "callsites": "^3.0.0"
+      }
+    },
+    "parseurl": {
+      "version": "1.3.2",
+      "resolved": "https://registry.npmjs.org/parseurl/-/parseurl-1.3.2.tgz",
+      "integrity": "sha1-/CidTtiZMRlGDBViUyYs3I3mW/M="
+    },
+    "path-is-absolute": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/path-is-absolute/-/path-is-absolute-1.0.1.tgz",
+      "integrity": "sha1-F0uSaHNVNP+8es5r9TpanhtcX18=",
+      "dev": true
+    },
+    "path-is-inside": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/path-is-inside/-/path-is-inside-1.0.2.tgz",
+      "integrity": "sha1-NlQX3t5EQw0cEa9hAn+s8HS9/FM=",
+      "dev": true
+    },
+    "path-key": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/path-key/-/path-key-2.0.1.tgz",
+      "integrity": "sha1-QRyttXTFoUDTpLGRDUDYDMn0C0A=",
+      "dev": true
+    },
+    "path-parse": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/path-parse/-/path-parse-1.0.5.tgz",
+      "integrity": "sha1-PBrfhx6pzWyUMbbqK9dKD/BVxME=",
+      "dev": true
+    },
+    "path-to-regexp": {
+      "version": "0.1.7",
+      "resolved": "https://registry.npmjs.org/path-to-regexp/-/path-to-regexp-0.1.7.tgz",
+      "integrity": "sha1-32BBeABfUi8V60SQ5yR6G/qmf4w="
+    },
+    "prelude-ls": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/prelude-ls/-/prelude-ls-1.1.2.tgz",
+      "integrity": "sha1-IZMqVJ9eUv/ZqCf1cOBL5iqX2lQ=",
+      "dev": true
+    },
+    "process-nextick-args": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/process-nextick-args/-/process-nextick-args-2.0.0.tgz",
+      "integrity": "sha512-MtEC1TqN0EU5nephaJ4rAtThHtC86dNN9qCuEhtshvpVBkAW5ZO7BASN9REnF9eoXGcRub+pFuKEpOHE+HbEMw==",
+      "dev": true
+    },
+    "progress": {
+      "version": "2.0.3",
+      "resolved": "https://registry.npmjs.org/progress/-/progress-2.0.3.tgz",
+      "integrity": "sha512-7PiHtLll5LdnKIMw100I+8xJXR5gW2QwWYkT6iJva0bXitZKa/XMrSbdmg3r2Xnaidz9Qumd0VPaMrZlF9V9sA==",
+      "dev": true
+    },
+    "proxy-addr": {
+      "version": "2.0.3",
+      "resolved": "https://registry.npmjs.org/proxy-addr/-/proxy-addr-2.0.3.tgz",
+      "integrity": "sha512-jQTChiCJteusULxjBp8+jftSQE5Obdl3k4cnmLA6WXtK6XFuWRnvVL7aCiBqaLPM8c4ph0S4tKna8XvmIwEnXQ==",
+      "requires": {
+        "forwarded": "~0.1.2",
+        "ipaddr.js": "1.6.0"
+      }
+    },
+    "punycode": {
+      "version": "2.1.1",
+      "resolved": "https://registry.npmjs.org/punycode/-/punycode-2.1.1.tgz",
+      "integrity": "sha512-XRsRjdf+j5ml+y/6GKHPZbrF/8p2Yga0JPtdqTIY2Xe5ohJPD9saDJJLPvp9+NSBprVvevdXZybnj2cv8OEd0A==",
+      "dev": true
+    },
+    "qs": {
+      "version": "6.5.1",
+      "resolved": "https://registry.npmjs.org/qs/-/qs-6.5.1.tgz",
+      "integrity": "sha512-eRzhrN1WSINYCDCbrz796z37LOe3m5tmW7RQf6oBntukAG1nmovJvhnwHHRMAfeoItc1m2Hk02WER2aQ/iqs+A=="
+    },
+    "querystring": {
+      "version": "0.2.0",
+      "resolved": "https://registry.npmjs.org/querystring/-/querystring-0.2.0.tgz",
+      "integrity": "sha1-sgmEkgO7Jd+CDadW50cAWHhSFiA=",
+      "dev": true
+    },
+    "range-parser": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/range-parser/-/range-parser-1.2.0.tgz",
+      "integrity": "sha1-9JvmtIeJTdxA3MlKMi9hEJLgDV4="
+    },
+    "raw-body": {
+      "version": "2.3.2",
+      "resolved": "https://registry.npmjs.org/raw-body/-/raw-body-2.3.2.tgz",
+      "integrity": "sha1-vNYMd9Prk83gBQKVw/N5OJvIj4k=",
+      "requires": {
+        "bytes": "3.0.0",
+        "http-errors": "1.6.2",
+        "iconv-lite": "0.4.19",
+        "unpipe": "1.0.0"
+      }
+    },
+    "readable-stream": {
+      "version": "2.3.6",
+      "resolved": "http://registry.npmjs.org/readable-stream/-/readable-stream-2.3.6.tgz",
+      "integrity": "sha512-tQtKA9WIAhBF3+VLAseyMqZeBjW0AHJoxOtYqSUZNJxauErmLbVm2FW1y+J/YA9dUrAC39ITejlZWhVIwawkKw==",
+      "dev": true,
+      "requires": {
+        "core-util-is": "~1.0.0",
+        "inherits": "~2.0.3",
+        "isarray": "~1.0.0",
+        "process-nextick-args": "~2.0.0",
+        "safe-buffer": "~5.1.1",
+        "string_decoder": "~1.1.1",
+        "util-deprecate": "~1.0.1"
+      }
+    },
+    "regexpp": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/regexpp/-/regexpp-2.0.1.tgz",
+      "integrity": "sha512-lv0M6+TkDVniA3aD1Eg0DVpfU/booSu7Eev3TDO/mZKHBfVjgCGTV4t4buppESEYDtkArYFOxTJWv6S5C+iaNw==",
+      "dev": true
+    },
+    "resolve": {
+      "version": "1.5.0",
+      "resolved": "https://registry.npmjs.org/resolve/-/resolve-1.5.0.tgz",
+      "integrity": "sha512-hgoSGrc3pjzAPHNBg+KnFcK2HwlHTs/YrAGUr6qgTVUZmXv1UEXXl0bZNBKMA9fud6lRYFdPGz0xXxycPzmmiw==",
+      "dev": true,
+      "requires": {
+        "path-parse": "^1.0.5"
+      }
+    },
+    "resolve-from": {
+      "version": "4.0.0",
+      "resolved": "https://registry.npmjs.org/resolve-from/-/resolve-from-4.0.0.tgz",
+      "integrity": "sha512-pb/MYmXstAkysRFx8piNI1tGFNQIFA3vkE3Gq4EuA1dF6gHp/+vgZqsCGJapvy8N3Q+4o7FwvquPJcnZ7RYy4g==",
+      "dev": true
+    },
+    "restore-cursor": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/restore-cursor/-/restore-cursor-2.0.0.tgz",
+      "integrity": "sha1-n37ih/gv0ybU/RYpI9YhKe7g368=",
+      "requires": {
+        "onetime": "^2.0.0",
+        "signal-exit": "^3.0.2"
+      }
+    },
+    "resumer": {
+      "version": "0.0.0",
+      "resolved": "https://registry.npmjs.org/resumer/-/resumer-0.0.0.tgz",
+      "integrity": "sha1-8ej0YeQGS6Oegq883CqMiT0HZ1k=",
+      "dev": true,
+      "requires": {
+        "through": "~2.3.4"
+      }
+    },
+    "rimraf": {
+      "version": "2.6.3",
+      "resolved": "https://registry.npmjs.org/rimraf/-/rimraf-2.6.3.tgz",
+      "integrity": "sha512-mwqeW5XsA2qAejG46gYdENaxXjx9onRNCfn7L0duuP4hCuTIi/QO7PDK07KJfp1d+izWPrzEJDcSqBa0OZQriA==",
+      "dev": true,
+      "requires": {
+        "glob": "^7.1.3"
+      },
+      "dependencies": {
+        "glob": {
+          "version": "7.1.3",
+          "resolved": "https://registry.npmjs.org/glob/-/glob-7.1.3.tgz",
+          "integrity": "sha512-vcfuiIxogLV4DlGBHIUOwI0IbrJ8HWPc4MU7HzviGeNho/UJDfi6B5p3sHeWIQ0KGIU0Jpxi5ZHxemQfLkkAwQ==",
+          "dev": true,
+          "requires": {
+            "fs.realpath": "^1.0.0",
+            "inflight": "^1.0.4",
+            "inherits": "2",
+            "minimatch": "^3.0.4",
+            "once": "^1.3.0",
+            "path-is-absolute": "^1.0.0"
+          }
+        }
+      }
+    },
+    "router": {
+      "version": "1.3.3",
+      "resolved": "https://registry.npmjs.org/router/-/router-1.3.3.tgz",
+      "integrity": "sha1-wUL2tepNazNZAiypW2WAvSF/ic8=",
+      "requires": {
+        "array-flatten": "2.1.1",
+        "debug": "2.6.9",
+        "methods": "~1.1.2",
+        "parseurl": "~1.3.2",
+        "path-to-regexp": "0.1.7",
+        "setprototypeof": "1.1.0",
+        "utils-merge": "1.0.1"
+      },
+      "dependencies": {
+        "array-flatten": {
+          "version": "2.1.1",
+          "resolved": "https://registry.npmjs.org/array-flatten/-/array-flatten-2.1.1.tgz",
+          "integrity": "sha1-Qmu52oQJDBg42BLIFQryCoMx4pY="
+        }
+      }
+    },
+    "run-async": {
+      "version": "2.3.0",
+      "resolved": "https://registry.npmjs.org/run-async/-/run-async-2.3.0.tgz",
+      "integrity": "sha1-A3GrSuC91yDUFm19/aZP96RFpsA=",
+      "requires": {
+        "is-promise": "^2.1.0"
+      }
+    },
+    "rxjs": {
+      "version": "6.4.0",
+      "resolved": "https://registry.npmjs.org/rxjs/-/rxjs-6.4.0.tgz",
+      "integrity": "sha512-Z9Yfa11F6B9Sg/BK9MnqnQ+aQYicPLtilXBp2yUtDt2JRCE0h26d33EnfO3ZxoNxG0T92OUucP3Ct7cpfkdFfw==",
+      "requires": {
+        "tslib": "^1.9.0"
+      }
+    },
+    "safe-buffer": {
+      "version": "5.1.1",
+      "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.1.1.tgz",
+      "integrity": "sha512-kKvNJn6Mm93gAczWVJg7wH+wGYWNrDHdWvpUmHyEsgCtIwwo3bqPtV4tR5tuPaUhTOo/kvhVwd8XwwOllGYkbg=="
+    },
+    "safer-buffer": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/safer-buffer/-/safer-buffer-2.1.2.tgz",
+      "integrity": "sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg=="
+    },
+    "semver": {
+      "version": "5.6.0",
+      "resolved": "https://registry.npmjs.org/semver/-/semver-5.6.0.tgz",
+      "integrity": "sha512-RS9R6R35NYgQn++fkDWaOmqGoj4Ek9gGs+DPxNUZKuwE183xjJroKvyo1IzVFeXvUrvmALy6FWD5xrdJT25gMg=="
+    },
+    "send": {
+      "version": "0.16.2",
+      "resolved": "https://registry.npmjs.org/send/-/send-0.16.2.tgz",
+      "integrity": "sha512-E64YFPUssFHEFBvpbbjr44NCLtI1AohxQ8ZSiJjQLskAdKuriYEP6VyGEsRDH8ScozGpkaX1BGvhanqCwkcEZw==",
+      "requires": {
+        "debug": "2.6.9",
+        "depd": "~1.1.2",
+        "destroy": "~1.0.4",
+        "encodeurl": "~1.0.2",
+        "escape-html": "~1.0.3",
+        "etag": "~1.8.1",
+        "fresh": "0.5.2",
+        "http-errors": "~1.6.2",
+        "mime": "1.4.1",
+        "ms": "2.0.0",
+        "on-finished": "~2.3.0",
+        "range-parser": "~1.2.0",
+        "statuses": "~1.4.0"
+      },
+      "dependencies": {
+        "mime": {
+          "version": "1.4.1",
+          "resolved": "https://registry.npmjs.org/mime/-/mime-1.4.1.tgz",
+          "integrity": "sha512-KI1+qOZu5DcW6wayYHSzR/tXKCDC5Om4s1z2QJjDULzLcmf3DvzS7oluY4HCTrc+9FiKmWUgeNLg7W3uIQvxtQ=="
+        }
+      }
+    },
+    "serve-static": {
+      "version": "1.13.2",
+      "resolved": "https://registry.npmjs.org/serve-static/-/serve-static-1.13.2.tgz",
+      "integrity": "sha512-p/tdJrO4U387R9oMjb1oj7qSMaMfmOyd4j9hOFoxZe2baQszgHcSWjuya/CiT5kgZZKRudHNOA0pYXOl8rQ5nw==",
+      "requires": {
+        "encodeurl": "~1.0.2",
+        "escape-html": "~1.0.3",
+        "parseurl": "~1.3.2",
+        "send": "0.16.2"
+      }
+    },
+    "setprototypeof": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/setprototypeof/-/setprototypeof-1.1.0.tgz",
+      "integrity": "sha512-BvE/TwpZX4FXExxOxZyRGQQv651MSwmWKZGqvmPcRIjDqWub67kTKuIMx43cZZrS/cBBzwBcNDWoFxt2XEFIpQ=="
+    },
+    "shebang-command": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/shebang-command/-/shebang-command-1.2.0.tgz",
+      "integrity": "sha1-RKrGW2lbAzmJaMOfNj/uXer98eo=",
+      "dev": true,
+      "requires": {
+        "shebang-regex": "^1.0.0"
+      }
+    },
+    "shebang-regex": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/shebang-regex/-/shebang-regex-1.0.0.tgz",
+      "integrity": "sha1-2kL0l0DAtC2yypcoVxyxkMmO/qM=",
+      "dev": true
+    },
+    "signal-exit": {
+      "version": "3.0.2",
+      "resolved": "https://registry.npmjs.org/signal-exit/-/signal-exit-3.0.2.tgz",
+      "integrity": "sha1-tf3AjxKH6hF4Yo5BXiUTK3NkbG0="
+    },
+    "slice-ansi": {
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/slice-ansi/-/slice-ansi-2.1.0.tgz",
+      "integrity": "sha512-Qu+VC3EwYLldKa1fCxuuvULvSJOKEgk9pi8dZeCVK7TqBfUNTH4sFkk4joj8afVSfAYgJoSOetjx9QWOJ5mYoQ==",
+      "dev": true,
+      "requires": {
+        "ansi-styles": "^3.2.0",
+        "astral-regex": "^1.0.0",
+        "is-fullwidth-code-point": "^2.0.0"
+      }
+    },
+    "sprintf-js": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/sprintf-js/-/sprintf-js-1.0.3.tgz",
+      "integrity": "sha1-BOaSb2YolTVPPdAVIDYzuFcpfiw=",
+      "dev": true
+    },
+    "statuses": {
+      "version": "1.4.0",
+      "resolved": "https://registry.npmjs.org/statuses/-/statuses-1.4.0.tgz",
+      "integrity": "sha512-zhSCtt8v2NDrRlPQpCNtw/heZLtfUDqxBM1udqikb/Hbk52LK4nQSwr10u77iopCW5LsyHpuXS0GnEc48mLeew=="
+    },
+    "stremio-addon-client": {
+      "version": "git+https://github.com/Stremio/stremio-addon-client.git#3a0149583896e9afd510f5f71290632a41ca535c",
+      "from": "git+https://github.com/Stremio/stremio-addon-client.git#v1.16.1",
+      "dev": true,
+      "requires": {
+        "node-fetch": "^2.1.2",
+        "stremio-addon-linter": "^1.7.0",
+        "thunky": "^1.0.2",
+        "url": "^0.11.0"
+      }
+    },
+    "stremio-addon-linter": {
+      "version": "1.7.0",
+      "resolved": "https://registry.npmjs.org/stremio-addon-linter/-/stremio-addon-linter-1.7.0.tgz",
+      "integrity": "sha512-ck1L1Wp2qvAhvXLj+4Lq1XRn8K3r2gx1i/f+e1W6K0+Et/oIYYDmaIVoh3SvExiNbCBcbJjH9WWEeDYKoqaMqQ==",
+      "requires": {
+        "semver": "^5.5.0"
+      }
+    },
+    "string-width": {
+      "version": "2.1.1",
+      "resolved": "https://registry.npmjs.org/string-width/-/string-width-2.1.1.tgz",
+      "integrity": "sha512-nOqH59deCq9SRHlxq1Aw85Jnt4w6KvLKqWVik6oA9ZklXLNIOlqg4F2yrT1MVaTjAqvVwdfeZ7w7aCvJD7ugkw==",
+      "requires": {
+        "is-fullwidth-code-point": "^2.0.0",
+        "strip-ansi": "^4.0.0"
+      }
+    },
+    "string.prototype.trim": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/string.prototype.trim/-/string.prototype.trim-1.1.2.tgz",
+      "integrity": "sha1-0E3iyJ4Tf019IG8Ia17S+ua+jOo=",
+      "dev": true,
+      "requires": {
+        "define-properties": "^1.1.2",
+        "es-abstract": "^1.5.0",
+        "function-bind": "^1.0.2"
+      }
+    },
+    "string_decoder": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.1.1.tgz",
+      "integrity": "sha512-n/ShnvDi6FHbbVfviro+WojiFzv+s8MPMHBczVePfUpDJLwoLT0ht1l4YwBCbi8pJAveEEdnkHyPyTP/mzRfwg==",
+      "dev": true,
+      "requires": {
+        "safe-buffer": "~5.1.0"
+      }
+    },
+    "strip-ansi": {
+      "version": "4.0.0",
+      "resolved": "https://registry.npmjs.org/strip-ansi/-/strip-ansi-4.0.0.tgz",
+      "integrity": "sha1-qEeQIusaw2iocTibY1JixQXuNo8=",
+      "requires": {
+        "ansi-regex": "^3.0.0"
+      }
+    },
+    "strip-json-comments": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/strip-json-comments/-/strip-json-comments-2.0.1.tgz",
+      "integrity": "sha1-PFMZQukIwml8DsNEhYwobHygpgo=",
+      "dev": true
+    },
+    "superagent": {
+      "version": "3.8.3",
+      "resolved": "https://registry.npmjs.org/superagent/-/superagent-3.8.3.tgz",
+      "integrity": "sha512-GLQtLMCoEIK4eDv6OGtkOoSMt3D+oq0y3dsxMuYuDvaNUvuT8eFBuLmfR0iYYzHC1e8hpzC6ZsxbuP6DIalMFA==",
+      "dev": true,
+      "requires": {
+        "component-emitter": "^1.2.0",
+        "cookiejar": "^2.1.0",
+        "debug": "^3.1.0",
+        "extend": "^3.0.0",
+        "form-data": "^2.3.1",
+        "formidable": "^1.2.0",
+        "methods": "^1.1.1",
+        "mime": "^1.4.1",
+        "qs": "^6.5.1",
+        "readable-stream": "^2.3.5"
+      },
+      "dependencies": {
+        "debug": {
+          "version": "3.2.6",
+          "resolved": "https://registry.npmjs.org/debug/-/debug-3.2.6.tgz",
+          "integrity": "sha512-mel+jf7nrtEl5Pn1Qx46zARXKDpBbvzezse7p7LqINmdoIk8PYP5SySaxEmYv6TZ0JyEKA1hsCId6DIhgITtWQ==",
+          "dev": true,
+          "requires": {
+            "ms": "^2.1.1"
+          }
+        },
+        "mime": {
+          "version": "1.6.0",
+          "resolved": "https://registry.npmjs.org/mime/-/mime-1.6.0.tgz",
+          "integrity": "sha512-x0Vn8spI+wuJ1O6S7gnbaQg8Pxh4NNHb7KSINmEWKiPE4RKOplvijn+NkmYmmRgP68mc70j2EbeTFRsrswaQeg==",
+          "dev": true
+        },
+        "ms": {
+          "version": "2.1.1",
+          "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.1.tgz",
+          "integrity": "sha512-tgp+dl5cGk28utYktBsrFqA7HKgrhgPsg6Z/EfhWI4gl1Hwq8B/GmY/0oXZ6nF8hDVesS/FpnYaD/kOWhYQvyg==",
+          "dev": true
+        }
+      }
+    },
+    "supertest": {
+      "version": "3.3.0",
+      "resolved": "https://registry.npmjs.org/supertest/-/supertest-3.3.0.tgz",
+      "integrity": "sha512-dMQSzYdaZRSANH5LL8kX3UpgK9G1LRh/jnggs/TI0W2Sz7rkMx9Y48uia3K9NgcaWEV28tYkBnXE4tiFC77ygQ==",
+      "dev": true,
+      "requires": {
+        "methods": "^1.1.2",
+        "superagent": "^3.8.3"
+      }
+    },
+    "supports-color": {
+      "version": "5.5.0",
+      "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-5.5.0.tgz",
+      "integrity": "sha512-QjVjwdXIt408MIiAqCX4oUKsgU2EqAGzs2Ppkm4aQYbjm+ZEWEcW4SfFNTr4uMNZma0ey4f5lgLrkB0aX0QMow==",
+      "requires": {
+        "has-flag": "^3.0.0"
+      }
+    },
+    "table": {
+      "version": "5.2.3",
+      "resolved": "https://registry.npmjs.org/table/-/table-5.2.3.tgz",
+      "integrity": "sha512-N2RsDAMvDLvYwFcwbPyF3VmVSSkuF+G1e+8inhBLtHpvwXGw4QRPEZhihQNeEN0i1up6/f6ObCJXNdlRG3YVyQ==",
+      "dev": true,
+      "requires": {
+        "ajv": "^6.9.1",
+        "lodash": "^4.17.11",
+        "slice-ansi": "^2.1.0",
+        "string-width": "^3.0.0"
+      },
+      "dependencies": {
+        "ansi-regex": {
+          "version": "4.0.0",
+          "resolved": "https://registry.npmjs.org/ansi-regex/-/ansi-regex-4.0.0.tgz",
+          "integrity": "sha512-iB5Dda8t/UqpPI/IjsejXu5jOGDrzn41wJyljwPH65VCIbk6+1BzFIMJGFwTNrYXT1CrD+B4l19U7awiQ8rk7w==",
+          "dev": true
+        },
+        "string-width": {
+          "version": "3.0.0",
+          "resolved": "https://registry.npmjs.org/string-width/-/string-width-3.0.0.tgz",
+          "integrity": "sha512-rr8CUxBbvOZDUvc5lNIJ+OC1nPVpz+Siw9VBtUjB9b6jZehZLFt0JMCZzShFHIsI8cbhm0EsNIfWJMFV3cu3Ew==",
+          "dev": true,
+          "requires": {
+            "emoji-regex": "^7.0.1",
+            "is-fullwidth-code-point": "^2.0.0",
+            "strip-ansi": "^5.0.0"
+          }
+        },
+        "strip-ansi": {
+          "version": "5.0.0",
+          "resolved": "https://registry.npmjs.org/strip-ansi/-/strip-ansi-5.0.0.tgz",
+          "integrity": "sha512-Uu7gQyZI7J7gn5qLn1Np3G9vcYGTVqB+lFTytnDJv83dd8T22aGH451P3jueT2/QemInJDfxHB5Tde5OzgG1Ow==",
+          "dev": true,
+          "requires": {
+            "ansi-regex": "^4.0.0"
+          }
+        }
+      }
+    },
+    "tape": {
+      "version": "4.9.0",
+      "resolved": "https://registry.npmjs.org/tape/-/tape-4.9.0.tgz",
+      "integrity": "sha512-j0jO9BiScfqtPBb9QmPLL0qvxXMz98xjkMb7x8lKipFlJZwNJkqkWPou+NU4V6T9RnVh1kuSthLE8gLrN8bBfw==",
+      "dev": true,
+      "requires": {
+        "deep-equal": "~1.0.1",
+        "defined": "~1.0.0",
+        "for-each": "~0.3.2",
+        "function-bind": "~1.1.1",
+        "glob": "~7.1.2",
+        "has": "~1.0.1",
+        "inherits": "~2.0.3",
+        "minimist": "~1.2.0",
+        "object-inspect": "~1.5.0",
+        "resolve": "~1.5.0",
+        "resumer": "~0.0.0",
+        "string.prototype.trim": "~1.1.2",
+        "through": "~2.3.8"
+      }
+    },
+    "text-table": {
+      "version": "0.2.0",
+      "resolved": "https://registry.npmjs.org/text-table/-/text-table-0.2.0.tgz",
+      "integrity": "sha1-f17oI66AUgfACvLfSoTsP8+lcLQ=",
+      "dev": true
+    },
+    "through": {
+      "version": "2.3.8",
+      "resolved": "https://registry.npmjs.org/through/-/through-2.3.8.tgz",
+      "integrity": "sha1-DdTJ/6q8NXlgsbckEV1+Doai4fU="
+    },
+    "thunky": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/thunky/-/thunky-1.1.0.tgz",
+      "integrity": "sha512-eHY7nBftgThBqOyHGVN+l8gF0BucP09fMo0oO/Lb0w1OF80dJv+lDVpXG60WMQvkcxAkNybKsrEIE3ZtKGmPrA==",
+      "dev": true
+    },
+    "tmp": {
+      "version": "0.0.33",
+      "resolved": "https://registry.npmjs.org/tmp/-/tmp-0.0.33.tgz",
+      "integrity": "sha512-jRCJlojKnZ3addtTOjdIqoRuPEKBvNXcGYqzO6zWZX8KfKEpnGY5jfggJQ3EjKuu8D4bJRr0y+cYJFmYbImXGw==",
+      "requires": {
+        "os-tmpdir": "~1.0.2"
+      }
+    },
+    "tslib": {
+      "version": "1.9.3",
+      "resolved": "https://registry.npmjs.org/tslib/-/tslib-1.9.3.tgz",
+      "integrity": "sha512-4krF8scpejhaOgqzBEcGM7yDIEfi0/8+8zDRZhNZZ2kjmHJ4hv3zCbQWxoJGz1iw5U0Jl0nma13xzHXcncMavQ=="
+    },
+    "type-check": {
+      "version": "0.3.2",
+      "resolved": "https://registry.npmjs.org/type-check/-/type-check-0.3.2.tgz",
+      "integrity": "sha1-WITKtRLPHTVeP7eE8wgEsrUg23I=",
+      "dev": true,
+      "requires": {
+        "prelude-ls": "~1.1.2"
+      }
+    },
+    "type-is": {
+      "version": "1.6.16",
+      "resolved": "https://registry.npmjs.org/type-is/-/type-is-1.6.16.tgz",
+      "integrity": "sha512-HRkVv/5qY2G6I8iab9cI7v1bOIdhm94dVjQCPFElW9W+3GeDOSHmy2EBYe4VTApuzolPcmgFTN3ftVJRKR2J9Q==",
+      "requires": {
+        "media-typer": "0.3.0",
+        "mime-types": "~2.1.18"
+      }
+    },
+    "unpipe": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/unpipe/-/unpipe-1.0.0.tgz",
+      "integrity": "sha1-sr9O6FFKrmFltIF4KdIbLvSZBOw="
+    },
+    "uri-js": {
+      "version": "4.2.2",
+      "resolved": "https://registry.npmjs.org/uri-js/-/uri-js-4.2.2.tgz",
+      "integrity": "sha512-KY9Frmirql91X2Qgjry0Wd4Y+YTdrdZheS8TFwvkbLWf/G5KNJDCh6pKL5OZctEW4+0Baa5idK2ZQuELRwPznQ==",
+      "dev": true,
+      "requires": {
+        "punycode": "^2.1.0"
+      }
+    },
+    "url": {
+      "version": "0.11.0",
+      "resolved": "https://registry.npmjs.org/url/-/url-0.11.0.tgz",
+      "integrity": "sha1-ODjpfPxgUh63PFJajlW/3Z4uKPE=",
+      "dev": true,
+      "requires": {
+        "punycode": "1.3.2",
+        "querystring": "0.2.0"
+      },
+      "dependencies": {
+        "punycode": {
+          "version": "1.3.2",
+          "resolved": "https://registry.npmjs.org/punycode/-/punycode-1.3.2.tgz",
+          "integrity": "sha1-llOgNvt8HuQjQvIyXM7v6jkmxI0=",
+          "dev": true
+        }
+      }
+    },
+    "util-deprecate": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/util-deprecate/-/util-deprecate-1.0.2.tgz",
+      "integrity": "sha1-RQ1Nyfpw3nMnYvvS1KKJgUGaDM8=",
+      "dev": true
+    },
+    "utils-merge": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/utils-merge/-/utils-merge-1.0.1.tgz",
+      "integrity": "sha1-n5VxD1CiZ5R7LMwSR0HBAoQn5xM="
+    },
+    "vary": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/vary/-/vary-1.1.2.tgz",
+      "integrity": "sha1-IpnwLG3tMNSllhsLn3RSShj2NPw="
+    },
+    "which": {
+      "version": "1.3.1",
+      "resolved": "https://registry.npmjs.org/which/-/which-1.3.1.tgz",
+      "integrity": "sha512-HxJdYWq1MTIQbJ3nw0cqssHoTNU267KlrDuGZ1WYlxDStUtKUhOaJmh112/TZmHxxUfuJqPXSOm7tDyas0OSIQ==",
+      "dev": true,
+      "requires": {
+        "isexe": "^2.0.0"
+      }
+    },
+    "wordwrap": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/wordwrap/-/wordwrap-1.0.0.tgz",
+      "integrity": "sha1-J1hIEIkUVqQXHI0CJkQa3pDLyus=",
+      "dev": true
+    },
+    "wrappy": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+      "integrity": "sha1-tSQ9jz7BqjXxNkYFvA0QNuMKtp8=",
+      "dev": true
+    },
+    "write": {
+      "version": "0.2.1",
+      "resolved": "https://registry.npmjs.org/write/-/write-0.2.1.tgz",
+      "integrity": "sha1-X8A4KOJkzqP+kUVUdvejxWbLB1c=",
+      "dev": true,
+      "requires": {
+        "mkdirp": "^0.5.1"
+      }
+    }
+  }
+}
+
+
+
+---
+File: /package.json
+---
+
+{
+  "name": "stremio-addon-sdk",
+  "version": "1.6.10",
+  "description": "An SDK for making and publishing Stremio add-ons",
+  "main": "./src/index.js",
+  "scripts": {
+    "pretest": "eslint --ignore-path .gitignore .",
+    "test": "tape test/*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Stremio/stremio-addon-sdk.git"
+  },
+  "keywords": [
+    "stremio",
+    "addons",
+    "video",
+    "streaming"
+  ],
+  "author": "Smart Code OOD",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Stremio/stremio-addon-sdk/issues"
+  },
+  "bin": {
+    "addon-bootstrap": "./cli/bootstrap.js"
+  },
+  "homepage": "https://github.com/Stremio/stremio-addon-sdk#readme",
+  "dependencies": {
+    "chalk": "^2.4.2",
+    "cors": "^2.8.4",
+    "express": "^4.16.3",
+    "inquirer": "^6.2.2",
+    "mkdirp": "^0.5.1",
+    "node-fetch": "^2.3.0",
+    "opn": "^5.4.0",
+    "router": "^1.3.3",
+    "stremio-addon-linter": "^1.7.0"
+  },
+  "devDependencies": {
+    "eslint": "^5.13.0",
+    "stremio-addon-client": "https://github.com/Stremio/stremio-addon-client.git#v1.16.1",
+    "supertest": "^3.3.0",
+    "tape": "^4.9.0"
+  }
+}
+
+
+
+---
+File: /README.md
+---
+
+# Stremio Addon SDK 🧙
+
+<img src="https://blog.stremio.com/wp-content/uploads/2023/08/stremio-logo-2023.png" alt="Stremio" width="250" />
+
+The **🧙  Stremio Addon SDK 🧙** was developed by the Stremio Team as a way of vastly simplifying Node.js addon creation for
+our streaming platform.
+
+Stremio currently supports Windows, macOS, Linux, Android and iOS.
+
+**Important: We strongly recommend deploying addons to the [BeamUp](./docs/deploying/beamup.md) servers**
+
+
+## Quick Example
+
+This arbitrary example creates an addon that provides a stream for Big Buck Bunny and outputs a HTTP address where you can access it.
+
+```javascript
+const { addonBuilder, serveHTTP, publishToCentral }  = require('stremio-addon-sdk')
+
+const builder = new addonBuilder({
+    id: 'org.myexampleaddon',
+    version: '1.0.0',
+
+    name: 'simple example',
+
+    // Properties that determine when Stremio picks this addon
+    // this means your addon will be used for streams of the type movie
+    catalogs: [],
+    resources: ['stream'],
+    types: ['movie'],
+    idPrefixes: ['tt']
+})
+
+// takes function(args)
+builder.defineStreamHandler(function(args) {
+    if (args.type === 'movie' && args.id === 'tt1254207') {
+        // serve one stream to big buck bunny
+        const stream = { url: 'http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4' }
+        return Promise.resolve({ streams: [stream] })
+    } else {
+        // otherwise return no streams
+        return Promise.resolve({ streams: [] })
+    }
+})
+
+serveHTTP(builder.getInterface(), { port: process.env.PORT || 7000 })
+//publishToCentral("https://your-domain/manifest.json") // <- invoke this if you want to publish your addon and it's accessible publically on "your-domain"
+```
+
+Save this as `addon.js` and run:
+
+```bash
+npm install stremio-addon-sdk
+node ./addon.js
+```
+
+It will output a URL that you can use to [install the addon in Stremio](./docs/testing.md#how-to-install-add-on-in-stremio)
+
+**Please note:** addon URLs in Stremio must be loaded with HTTPS (except `127.0.0.1`) and must support CORS! CORS support is handled automatically by the SDK, but if you're trying to load your addon remotely (not from `127.0.0.1`), you need to support HTTPS.
+
+
+## Getting started with a new addon
+
+In order to scaffold a new Stremio addon, we've made a tool called `addon-bootstrap`.
+
+You can use it in the following way:
+
+```bash
+npm install -g stremio-addon-sdk # use sudo if on Linux
+addon-bootstrap hello-world
+```
+
+You'll be asked about what [resources and types](./docs/api/README.md) you want to support, after which the addon will be created in the `hello-world` directory, and you'll be able to run it:
+
+```bash
+cd hello-world
+npm install
+npm start -- --launch
+```
+
+If you wish to install the addon in the Desktop version of Stremio (which you can [download here](https://www.stremio.com/downloads)), you should use `npm start -- --install`
+
+## Documentation
+
+All our documentation is [right here on GitHub](./docs). Take a look at our [examples list](./docs/examples.md) for some high-level
+information, or dive straight into our [SDK documentation](./docs/README.md) for our code reference docs.
+
+We also have an [example addon](https://github.com/Stremio/addon-helloworld) that you can use as a guide to help you build your own addon.
+
+We've made two step by step guides: one for this SDK, and one for any programming language, [which you can read here](https://stremio.github.io/stremio-addon-guide).
+
+If you don't wish to use Node.js (and therefore not use this SDK either), you can create addons in any programming
+language, see the [addon protocol specification](./docs/protocol.md) for more information.
+
+It is also possible to create an addon without any programming language, see our [static addon example](https://github.com/Stremio/stremio-static-addon-example) based
+on the protocol specification.
+
+SDK Features Include:
+
+- Publishing an addon through HTTP(s)
+- Publishing your addon link to the [public Addon collection](https://api.strem.io/addonscollection.json) with [publishToCentral](./docs/README.md#publishtocentralurl)
+- Creating a homepage for your addon that includes an "Install Addon" button
+
+## Testing
+
+For developers looking for a quick way to test their new addons, you can either:
+
+- [Test with Stremio](./docs/testing.md#testing-in-stremio-app)
+- [Test with our Web Version](./docs/testing.md#testing-in-stremio-web-version)
+
+
+## Deploying
+
+In order for your addon to be used by others, it needs to be deployed online.
+
+You can check our [list of recommended hosting providers for Node.js](./docs/deploying/README.md) or alternatively host it locally with [localtunnel](https://github.com/localtunnel/localtunnel).
+
+After you've deployed publically, in order to get your addon to show in Stremio (through the [public Addon collection](https://api.strem.io/addonscollection.json)), you need to use [publishToCentral](./docs/README.md#publishtocentralurl) or publish [manually through the UI](https://stremio.github.io/stremio-publish-addon/index.html).
+
+## Examples & tutorials
+
+Check out our ever growing list of [examples and demo addons](./docs/examples.md). This list also includes examples & tutorials on how to develop Stremio addons in PHP, Python, Ruby, C#, Rust, Java and Go. It also includes a list of video tutorials.
+
+### Rust version
+There is a third-party Rust version of this SDK built on stremio-core developed by Sleeyax [here](https://github.com/sleeyax/stremio-addon-sdk-rs).
+
+### Go version
+There is a third-party Go version of this SDK developed by doingodswork [here](https://github.com/Deflix-tv/go-stremio).
+
+
+## Advanced Usage
+
+Read our [guide for advanced usage](./docs/advanced.md) to understand the many ways that addons can be used.
+
+
+## Reporting Issues
+
+If you have any issues regarding the Stremio Addon SDK, please feel free to [report them here](https://github.com/Stremio/stremio-addon-sdk/issues).
+
+
+## Migration from v0.x
+
+To migrate from v0.x, you need to:
+
+- change `new addonSDK` to `new addonBuilder`, which you can import via `const addonBuilder = require('stremio-addon-sdk').addonBuilder`
+- change `addon.run(opts)` to `serveHTTP(addon.getInterface(), opts)`, which you can import via `const serveHTTP = require('stremio-addon-sdk').serveHTTP`
+- all handlers have to return a `Promise` (rather than take a `cb`)
+
+
+## Use Cases Outside Addon SDK
+
+The use of this SDK is not mandatory for creating Stremio Addons. You can use any programming language that supports
+creating a HTTP server to make Stremio Addons. Refer to our [protocol specification](./docs/protocol.md) for details and examples.
+
+One useful scenario of not using the SDK is when you need user specific data for you addon (for example, an API
+Autherntication Token), you can see an example of passing user specific data in the Addon URL [here](./docs/advanced.md#using-user-data-in-add-ons).
+This example uses Node.js and Express to get user specific data. (Update: the Addon SDK now supports [user settings](./docs/api/responses/manifest.md#user-data))
+
+
+_built with love and serious coding skills by the Stremio Team_
+
+<img src="https://blog.stremio.com/wp-content/uploads/2023/08/stremio-code-footer.jpg" width="300" />
+
