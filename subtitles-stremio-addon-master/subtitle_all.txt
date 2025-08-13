@@ -1,0 +1,384 @@
+Directory Structure:
+
+└── ./
+    ├── src
+    │   ├── generateSubtitles.js
+    │   ├── generateSubtitles.mock.js
+    │   └── generateSubtitles.spec.js
+    ├── .editorconfig
+    ├── .eslintrc.json
+    ├── addon.js
+    ├── jest.config.js
+    ├── package.json
+    └── README.md
+
+
+
+---
+File: /src/generateSubtitles.js
+---
+
+/* eslint-disable no-unused-vars */
+require('dotenv').config()
+const OS = require('opensubtitles-api')
+const axios = require('axios')
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3')
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner')
+
+const s3Client = new S3Client({
+  region: 'us-east-1',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+})
+
+async function openSubtitles (data) {
+  try {
+    const OpenSubtitles = new OS({
+      useragent: 'UserAgent',
+      ssl: true
+    })
+
+    const query = {
+      extensions: ['srt'],
+      limit: '10',
+      ...data
+    }
+
+    const subtitles = await OpenSubtitles.search(query)
+
+    if (!Object.keys(subtitles).length) {
+      console.log('No subtitles found')
+      return null
+    }
+
+    return subtitles
+  } catch (error) {
+    console.log('Error on open subtitles method', error)
+    return null
+  }
+}
+
+function formatSubtitles (subtitles) {
+  if (!subtitles) {
+    console.log('No subtitles to format')
+    return []
+  }
+
+  const languages = ['en', 'pb', 'pt']
+
+  const formattedSubtitles = []
+  languages.forEach(langCode => {
+    let i = 0
+    try {
+      for (const data of subtitles[langCode]) {
+        i++
+        formattedSubtitles.push({
+          id: `${langCode}-${i}`,
+          url: data.utf8,
+          lang: data.lang
+        })
+      }
+    } catch (error) {
+      console.log('Error on format subtitles method', error)
+    }
+  })
+
+  return formattedSubtitles || []
+}
+
+async function translateSubtitles (formattedSubtitles) {
+  const englishSubtitlesUrls = formattedSubtitles.map(subtitle => {
+    if (subtitle?.id?.includes('en')) {
+      return subtitle.url
+    }
+    return null
+  })?.filter(Boolean)
+
+  const translatedSubtitlesUrls = []
+  try {
+    // eslint-disable-next-line
+    for (const [index, url] of englishSubtitlesUrls.entries()) {
+      const englishSubtitleResponse = await axios.get(url)
+      const subtitle = englishSubtitleResponse.data
+
+      // TODO: implement translation
+
+      const savedFileUrl = await uploadTranslatedSubtitleToS3(`translated_english_subtitle_${index + 1}.srt`, subtitle)
+      translatedSubtitlesUrls.push(savedFileUrl)
+      break
+    }
+  } catch (error) {
+    console.log('Error on fetch and translate english subtitles', error)
+  }
+
+  const translatedSubtitles = translatedSubtitlesUrls.map((url, index) => {
+    return {
+      id: `translated-${index + 1}`,
+      url,
+      lang: 'Translated'
+    }
+  })
+
+  return translatedSubtitles
+}
+
+async function uploadTranslatedSubtitleToS3 (key, subtitle) {
+  const bucket = process.env.AWS_BUCKET_NAME
+  const uploadParams = {
+    Bucket: bucket,
+    Key: key,
+    Body: subtitle
+  }
+
+  const getParams = {
+    Bucket: bucket,
+    Key: key
+  }
+
+  try {
+    const uploadCommand = new PutObjectCommand(uploadParams)
+    await s3Client.send(uploadCommand)
+
+    const getCommand = new GetObjectCommand(getParams)
+    const presignedUrl = await getSignedUrl(s3Client, getCommand, { expiresIn: 3600 })
+    console.log('File uploaded successfully')
+
+    return presignedUrl
+  } catch (err) {
+    console.error('File not uploaded', err)
+  }
+}
+
+async function generateSubtitles (data) {
+  const subtitles = await openSubtitles(data)
+  const formattedSubtitles = formatSubtitles(subtitles)
+  const translatedSubtitles = await translateSubtitles(formattedSubtitles)
+  const subtitlesToReturn = [...formattedSubtitles, ...translatedSubtitles]
+  console.log(`Found ${subtitlesToReturn.length} subtitles`)
+
+  return subtitlesToReturn
+}
+
+module.exports = { generateSubtitles, formatSubtitles, translateSubtitles }
+
+
+
+---
+File: /src/generateSubtitles.mock.js
+---
+
+exports.mockSubtitles = { en: [{ url: 'https://dl.opensubtitles.org/en/download/src-api/vrf-19bd0c4e/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804111', langcode: 'en', downloads: 318485, lang: 'English', encoding: 'UTF-8', id: '1957804111', filename: 'Thor.Love.and.Thunder.2022.1080p.WEB-DL.DDP5.1.Atmos.H.264-EVO.srt', date: '2022-09-07 15:03:33', score: 0.5, fps: 23.976, format: 'srt', utf8: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19bd0c4e/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804111', vtt: 'https://dl.opensubtitles.org/en/download/subformat-vtt/src-api/vrf-19bd0c4e/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804111' }, { url: 'https://dl.opensubtitles.org/en/download/src-api/vrf-19c90c58/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804139', langcode: 'en', downloads: 80585, lang: 'English', encoding: 'UTF-8', id: '1957804139', filename: 'Thor.Love.and.Thunder.2022.1080p.WEB-DL.DDP5.1.Atmos.H.264-EVO-HI.srt', date: '2022-09-07 16:02:47', score: 0.5, fps: 23.976, format: 'srt', utf8: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19c90c58/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804139', vtt: 'https://dl.opensubtitles.org/en/download/subformat-vtt/src-api/vrf-19c90c58/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804139' }, { url: 'https://dl.opensubtitles.org/en/download/src-api/vrf-19d90c59/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957753245', langcode: 'en', downloads: 289441, lang: 'English', encoding: 'UTF-8', id: '1957753245', filename: 'Thor.Love.and.Thunder.2022.1080p.V3.TELESYNC.X264.AC3.Will1869.srt', date: '2022-07-25 07:16:09', score: 0.2, fps: 24, format: 'srt', utf8: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19d90c59/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957753245', vtt: 'https://dl.opensubtitles.org/en/download/subformat-vtt/src-api/vrf-19d90c59/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957753245' }, { url: 'https://dl.opensubtitles.org/en/download/src-api/vrf-19f00c62/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957818828', langcode: 'en', downloads: 3390, lang: 'English', encoding: 'UTF-8', id: '1957818828', filename: 'Thor: Love and Thunder Bluray (Audio Commentary).srt', date: '2022-09-20 15:00:32', score: 0.2, fps: 23.976, format: 'srt', utf8: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19f00c62/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957818828', vtt: 'https://dl.opensubtitles.org/en/download/subformat-vtt/src-api/vrf-19f00c62/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957818828' }, { url: 'https://dl.opensubtitles.org/en/download/src-api/vrf-19cf0c56/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957751154', langcode: 'en', downloads: 129282, lang: 'English', encoding: 'UTF-8', id: '1957751154', filename: 'Thor Love And Thunder 2022 1080p Telesync HEVC x265.srt', date: '2022-07-24 12:43:26', score: 0, fps: 24, format: 'srt', utf8: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19cf0c56/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957751154', vtt: 'https://dl.opensubtitles.org/en/download/subformat-vtt/src-api/vrf-19cf0c56/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957751154' }] }
+
+exports.mockFormattedSubtitles = [{ id: 'en-1', lang: 'English', url: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19bd0c4e/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804111' }, { id: 'en-2', lang: 'English', url: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19c90c58/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957804139' }, { id: 'en-3', lang: 'English', url: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19d90c59/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957753245' }, { id: 'en-4', lang: 'English', url: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19f00c62/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957818828' }, { id: 'en-5', lang: 'English', url: 'https://dl.opensubtitles.org/en/download/subencoding-utf8/src-api/vrf-19cf0c56/sid-kxMr3hB,jdIRLtr3IeFDfZ,3iJ2/filead/1957751154' }]
+
+
+
+---
+File: /src/generateSubtitles.spec.js
+---
+
+const { formatSubtitles } = require('./generateSubtitles')
+const { mockSubtitles, mockFormattedSubtitles } = require('./generateSubtitles.mock')
+
+jest.mock('axios')
+
+describe('formatSubtitles', () => {
+  it('should return formatted subtitles', () => {
+    const formattedSubtitles = formatSubtitles(mockSubtitles)
+    expect(formattedSubtitles).toEqual(mockFormattedSubtitles)
+  })
+})
+
+
+
+---
+File: /.editorconfig
+---
+
+# EditorConfig is awesome: https://EditorConfig.org
+
+# top-most EditorConfig file
+root = true
+
+[*]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+
+---
+File: /.eslintrc.json
+---
+
+{
+    "env": {
+        "es2021": true,
+        "node": true,
+        "jest": true
+    },
+    "extends": [
+        "standard"
+    ],
+    "parserOptions": {
+        "ecmaVersion": 12,
+        "sourceType": "module"
+    },
+    "rules": {
+    }
+}
+
+
+
+---
+File: /addon.js
+---
+
+/* eslint-disable no-unused-vars */
+/* eslint-disable new-cap */
+const { addonBuilder, serveHTTP, publishToCentral } = require('stremio-addon-sdk')
+const { generateSubtitles } = require('./src/generateSubtitles')
+
+const builder = new addonBuilder({
+  id: 'org.abcsubtitles',
+  version: '1.0.0',
+
+  logo: undefined,
+  name: 'Abc Subtitles',
+  description: 'Best subtitles to your movie',
+
+  types: ['movie', 'series'],
+  catalogs: [],
+  resources: [
+    'subtitles'
+  ]
+})
+
+builder.defineSubtitlesHandler(async function (args) {
+  const dataID = args.id.split(':')
+  if ((dataID[0]).slice(0, 2) === 'tt' && dataID[0].length <= 12) {
+    try {
+      let subtitles
+      if (dataID.length > 1) {
+        subtitles = await generateSubtitles({ imdbid: dataID[0], season: dataID[1], episode: dataID[2] })
+      } else {
+        subtitles = await generateSubtitles({ imdbid: dataID[0] })
+      }
+
+      return Promise.resolve({ subtitles: subtitles })
+    } catch (error) {
+      console.log(error)
+      return Promise.resolve({ subtitles: [] })
+    }
+  } else {
+    return Promise.resolve({ subtitles: [] })
+  }
+})
+
+serveHTTP(builder.getInterface(), {
+  port: process.env.PORT || 3010
+})
+
+// If you want this addon to appear in the addon catalogs, call .publishToCentral() with the publically available URL to your manifest
+// publishToCentral('https://my-addon.com/manifest.json')
+
+
+
+---
+File: /jest.config.js
+---
+
+module.exports = {
+  roots: [
+    '<rootDir>/src'
+  ],
+  coverageDirectory: 'coverage',
+  collectCoverageFrom: [
+    '<rootDir>/src/**/*.js'
+  ],
+  testEnvironment: 'node',
+  moduleNameMapper: {
+    axios: 'axios/dist/node/axios.cjs'
+  }
+}
+
+
+
+---
+File: /package.json
+---
+
+{
+  "name": "subtitles-stremio-addon",
+  "version": "1.1.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --passWithNoTests --silent --noStackTrace --runInBand",
+    "test:watch": "npm test -- --watch",
+    "start": "node --max-old-space-size=4096 addon.js"
+  },
+  "repository": "https://github.com/vmotta8/subtitles-translator-ts.git",
+  "author": "Vinicius Motta <viniciusmotta8@gmail.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^26.0.20",
+    "@types/node": "^14.14.22",
+    "eslint": "^7.19.0",
+    "eslint-config-standard": "^16.0.2",
+    "eslint-plugin-import": "^2.22.1",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^4.2.1",
+    "git-commit-msg-linter": "^3.0.0",
+    "jest": "^26.6.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.431.0",
+    "@aws-sdk/s3-request-presigner": "^3.431.0",
+    "axios": "^1.5.1",
+    "dotenv": "^8.2.0",
+    "opensubtitles-api": "^5.1.2",
+    "stremio-addon-sdk": "^1.6.5"
+  }
+}
+
+
+
+---
+File: /README.md
+---
+
+# Subtitles Stremio Addon
+
+Subtitles addon for [Stremio](https://www.stremio.com/). 
+  - [Stremio Github](https://github.com/Stremio)
+  - [stremio-addon-sdk](https://github.com/Stremio/stremio-addon-sdk) was used to develop the application
+
+### :bookmark: How it works
+Once installed, just open any movie or series and the subtitles will be there.
+
+In addition to the many languages, there will also be a subtitle with some words translated to help Brazilians who are learning English. For example: "The blight(praga) came and we had to burn it".
+
+### :clapper: Translated subtitle example
+<img src="public/stremiophoto.png">
+
+
+### :wrench: Tools and technologies
+  - Nodejs
+  - Jest
+  - Stremio Addon Sdk
+  - Open Subtitles Api
+
+### Author
+---
+<a>
+ <img style="border-radius: 50%;" src="https://avatars.githubusercontent.com/u/60989975?v=4" width="100px;" alt=""/>
+ <br/>
+ <sub><b>Vinicius Motta</b></sub></a> <a>🤘</a>
+
+[![Linkedin Badge](https://img.shields.io/badge/-Vinicius-blue?style=flat-square&logo=Linkedin&logoColor=white&link=https://www.linkedin.com/in/vmotta8/)](https://www.linkedin.com/in/vmotta8/)
+[![Gmail Badge](https://img.shields.io/badge/-viniciusmotta8@gmail.com-c14438?style=flat-square&logo=Gmail&logoColor=white&link=mailto:viniciusmotta8@gmail.com)](mailto:viniciusmotta8@gmail.com)
+
